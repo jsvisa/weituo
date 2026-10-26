@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::warn;
 
+use crate::decoder::build_decoder;
 use crate::provider::ChainInfo;
-use crate::rule_manager::build_decoder;
 use crate::types::{
     normalize_domain_name, AbiItem, DecoderKind, ExprValue, MulticallDecoder, RuleClause, RuleEntry,
 };

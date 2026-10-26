@@ -1,69 +1,88 @@
-//! Minimal embedding example: build a `Checker` with your own rule provider.
+//! Minimal embedding example: a stateless `Checker` over a `StaticResolver`.
 //!
 //! ```sh
 //! cargo run -p weituo-core --example embed_checker
 //! ```
 //!
-//! Everything here is local: the provider returns no rules, so the checker
-//! falls through to the configured token-op policy (`config/default.toml`) —
-//! swap `MyRules` for a real provider to check real transactions.
+//! Everything here is local and immutable: rules are prepared in memory (in
+//! real use they come from `static_loader::load` or a `RuleProvider` you
+//! cache behind a `RuleResolver`), and the checker is constructed from plain
+//! parameters — no config files, no background tasks.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use weituo_core::{
-    builtins::Builtins,
     checker::{CheckResult, Checker},
-    config::Settings,
-    provider::{ChainInfo, RuleProvider},
-    rule_manager::RuleManager,
-    types::{RuleEntry, Transaction},
+    policy::Policy,
+    provider::{ChainInfo, StaticResolver},
+    types::{ExprValue, RuleClause, RuleEntry, Transaction},
 };
 
-/// Supply rules from wherever they live (HTTP API, database, files…).
-struct MyRules;
-
-#[async_trait::async_trait]
-impl RuleProvider for MyRules {
-    async fn fetch_chain_info(&self, _chain_id: u64) -> anyhow::Result<ChainInfo> {
-        Ok(ChainInfo {
-            rpc_url: String::new(),
-        })
-    }
-
-    async fn fetch_contract_rules(
-        &self,
-        _chain_id: u64,
-        _address: &str,
-    ) -> anyhow::Result<HashMap<String, RuleEntry>> {
-        Ok(HashMap::new())
-    }
+/// A tiny rule set: allow `approve` on the USDT proxy only when the spender
+/// is the caller's own address.
+fn rules() -> HashMap<(u64, String), HashMap<String, RuleEntry>> {
+    let entry = RuleEntry {
+        clauses: vec![RuleClause {
+            expr: ExprValue::try_from(serde_json::json!("args.spender == from")).unwrap(),
+            vars: HashMap::new(),
+        }],
+        abi_item: Some(
+            serde_json::from_value(serde_json::json!({
+                "type": "function",
+                "name": "approve",
+                "inputs": [
+                    { "name": "spender", "type": "address" },
+                    { "name": "amount",  "type": "uint256" }
+                ],
+                "outputs": []
+            }))
+            .unwrap(),
+        ),
+        multicall: None,
+        invalid_decoder: false,
+    };
+    HashMap::from([(
+        (
+            1u64,
+            "0xdac17f958d2ee523a2206206994597c13d831ec7".to_string(),
+        ),
+        HashMap::from([("0x095ea7b3".to_string(), entry)]),
+    )])
 }
 
+/// Rules come from `static_loader::load` or a `RuleProvider` you cache behind
+/// a `RuleResolver`. Here: a static map plus one known RPC endpoint.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let settings = Settings::load_from("config/default.toml")?;
-    let http = reqwest::Client::new();
-    let provider: Arc<dyn RuleProvider> = Arc::new(MyRules);
-
-    let builtins = Builtins::new(settings.clone(), http, Arc::clone(&provider));
-    let rules = Arc::new(RuleManager::new(provider, settings.provider.clone()));
-    let checker = Checker::new(
-        rules,
-        builtins,
-        Vec::new(), // address allowlist
-        None,       // no scam oracle injected
-        settings.global_policy.clone(),
+    let resolver = StaticResolver::new(
+        rules(),
+        HashMap::from([(
+            1u64,
+            ChainInfo {
+                rpc_url: String::new(), // set a real RPC URL to enable $-builtins
+            },
+        )]),
     );
 
+    let checker = Checker::new(
+        reqwest::Client::new(),
+        Vec::new(), // sender allowlist
+        Policy::default(),
+    );
+
+    // approve(spender=0x2222…, amount=1) — spender is NOT the sender → denied.
+    let spender = "2222222222222222222222222222222222222222";
+    let amount = format!("{:0>64}", "1");
+    let data = format!("0x095ea7b3{spender:0>64}{amount}");
     let tx: Transaction = serde_json::from_value(serde_json::json!({
         "chainId": 1,
         "from": "0x1111111111111111111111111111111111111111",
-        "to": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-        "data": "0x095ea7b30000000000000000000000000000000000000000000000000000000000000001",
+        "to": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        "data": data,
         "value": 0,
     }))?;
 
-    match checker.check(&tx).await {
+    match checker.check(&tx, &resolver).await {
         CheckResult::Ok => println!("allowed"),
         CheckResult::Denied(reason) => println!("denied: {reason}"),
     }

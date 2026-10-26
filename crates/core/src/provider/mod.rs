@@ -1,15 +1,16 @@
-//! The rule-source integration point: [`RuleProvider`].
+//! The rule-source integration points.
 //!
-//! `weituo-core` only defines the trait — concrete backends (emp-api,
-//! waf-admin) live in the service layer. Implement this trait to feed rules
-//! from any source, or use [`crate::static_loader`] for local yaml files.
+//! [`RuleProvider`] fetches rules from a backend (HTTP API, database, …);
+//! [`RuleResolver`] is what the checker consumes per call — typically a
+//! cache sitting on top of a provider, owned by the embedding layer. The
+//! engine itself holds no rule state.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tracing::warn;
 
-use crate::rule_manager::build_decoder;
+use crate::decoder::build_decoder;
 use crate::types::{ExprValue, Rule, RuleClause, RuleEntry};
 
 #[derive(Debug, Clone)]
@@ -28,8 +29,73 @@ pub trait RuleProvider: Send + Sync {
     ) -> Result<HashMap<String, RuleEntry>>;
 }
 
+/// Per-call rule source for the checker — the engine keeps no rule cache.
+///
+/// Implementations live in the embedding layer and typically cache (TTL'd
+/// fetches from a [`RuleProvider`], statically loaded yaml, …). Core treats
+/// every answer as call-scoped data.
+#[async_trait]
+pub trait RuleResolver: Send + Sync {
+    /// Rules for one contract, keyed by lowercase selector (`"*"` wildcard
+    /// supported). `None` = contract unknown to the backend (the checker
+    /// reports `NoContract`); an entry missing from the map reports `NoRule`.
+    async fn contract_rules(
+        &self,
+        chain_id: u64,
+        address: &str,
+    ) -> Option<HashMap<String, RuleEntry>>;
+
+    /// RPC endpoint the `$`-builtins use for chain queries on this chain.
+    /// `None` = unknown — RPC-backed builtins error if a rule uses them.
+    fn chain_rpc_url(&self, chain_id: u64) -> Option<String>;
+}
+
+/// A [`RuleResolver`] over in-memory data — feed it the output of
+/// [`crate::static_loader::load`] or your own prepared rules.
+/// No I/O, no caching, no background tasks.
+pub struct StaticResolver {
+    contracts: HashMap<(u64, String), HashMap<String, RuleEntry>>,
+    rpc_urls: HashMap<u64, String>,
+}
+
+impl StaticResolver {
+    /// `contracts`: (chain_id, address) → selector → rule, `chains`: per-chain
+    /// info (non-empty `rpc_url`s are used for the `$`-builtins).
+    pub fn new(
+        contracts: HashMap<(u64, String), HashMap<String, RuleEntry>>,
+        chains: HashMap<u64, ChainInfo>,
+    ) -> Self {
+        let rpc_urls = chains
+            .into_iter()
+            .filter(|(_, info)| !info.rpc_url.is_empty())
+            .map(|(chain_id, info)| (chain_id, info.rpc_url))
+            .collect();
+        Self {
+            contracts,
+            rpc_urls,
+        }
+    }
+}
+
+#[async_trait]
+impl RuleResolver for StaticResolver {
+    async fn contract_rules(
+        &self,
+        chain_id: u64,
+        address: &str,
+    ) -> Option<HashMap<String, RuleEntry>> {
+        self.contracts
+            .get(&(chain_id, address.to_lowercase()))
+            .cloned()
+    }
+
+    fn chain_rpc_url(&self, chain_id: u64) -> Option<String> {
+        self.rpc_urls.get(&chain_id).cloned()
+    }
+}
+
 /// Shared helper: convert the raw Rule list (from either backend) into
-/// the selector → RuleEntry map that RuleManager stores.
+/// the selector → RuleEntry map that resolvers store.
 pub fn parse_rules(raw: Vec<Rule>) -> HashMap<String, RuleEntry> {
     let mut map = HashMap::new();
     for rule in raw {

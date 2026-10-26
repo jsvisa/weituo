@@ -209,3 +209,35 @@ fn apply_array_suffix(kind: &str, base: DynSolType) -> Result<DynSolType> {
     }
     Ok(current)
 }
+
+/// Build a [`MulticallDecoder`] from a rule's `decoder_type` + `decoder_config`
+/// (raw JSON object). Returns `None` when either part is missing — the caller
+/// decides whether that means "no multicall" or "invalid decoder".
+pub fn build_decoder(
+    kind: Option<crate::types::DecoderKind>,
+    config: Option<&serde_json::Value>,
+) -> Option<crate::types::MulticallDecoder> {
+    use crate::types::{DecoderKind, MulticallDecoder};
+    let kind = kind?;
+    let cfg = config?;
+    let s =
+        |key: &str, default: &str| -> String { cfg[key].as_str().unwrap_or(default).to_string() };
+    match kind {
+        DecoderKind::BytesArray => Some(MulticallDecoder::BytesArray {
+            data_param: s("data_param", "data"),
+        }),
+        DecoderKind::TupleArray => Some(MulticallDecoder::TupleArray {
+            calls_param: s("calls_param", "calls"),
+            data_field: s("data_field", "callData"),
+            target_field: s("target_field", "target"),
+        }),
+        DecoderKind::ParallelArrays => Some(MulticallDecoder::ParallelArrays {
+            data_param: s("data_param", "calldatas"),
+            target_param: s("target_param", "targets"),
+        }),
+        DecoderKind::UniversalRouter => Some(MulticallDecoder::UniversalRouter {
+            commands_param: s("commands_param", "commands"),
+            inputs_param: s("inputs_param", "inputs"),
+        }),
+    }
+}

@@ -42,7 +42,7 @@ fn unknown_decoder_kind_maps_to_none_not_error() {
 #[test]
 fn rule_with_unknown_decoder_type_and_config_sets_invalid_decoder() {
     // When decoder_type is unknown the Rule deserializes with decoder_type: None.
-    // rule_manager sets invalid_decoder = decoder is None AND decoder_config is Some.
+    // the service layer sets invalid_decoder = decoder is None AND decoder_config is Some.
     // We verify the Rule carries decoder_config so the manager can detect this case.
     let json = serde_json::json!([{
         "address": "0xabc",
@@ -63,7 +63,7 @@ fn rule_with_unknown_decoder_type_and_config_sets_invalid_decoder() {
     let would_be_invalid = rules[0].decoder_type.is_none() && rules[0].decoder_config.is_some();
     assert!(
         would_be_invalid,
-        "rule_manager must set invalid_decoder=true for this rule"
+        "the service layer must set invalid_decoder=true for this rule"
     );
 }
 

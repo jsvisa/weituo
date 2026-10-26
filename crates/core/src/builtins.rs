@@ -1,11 +1,6 @@
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use weituo_expr::context::BuiltinProvider;
 
-use crate::config::Settings;
-use crate::provider::RuleProvider;
 use crate::types::parse_u64_string;
 use alloy_primitives::U256;
 use serde_json::{json, Map, Value as Json};
@@ -13,49 +8,35 @@ use weituo_expr::eval::Value;
 use weituo_expr::EvalContext;
 
 /// Core engine builtins: generic chain-data helpers (`$block`, `$balance_of`,
-/// `$erc20_*`, `$gas_price`, `$now_ts`, `$pow`, …) resolvable from config or
-/// the active [`RuleProvider`].
+/// `$erc20_*`, `$gas_price`, `$now_ts`, `$pow`, …).
 ///
 /// External-data builtins (`$price_of`, `$is_scam`) are *not* part of core —
 /// embeddings provide them via a composite
 /// [`BuiltinProvider`](weituo_expr::context::BuiltinProvider) passed to
 /// [`crate::checker::Checker::new_with_builtins`].
+/// The engine's `$`-builtin provider: chain data read over JSON-RPC
+/// (`$block`, `$gas_price`, `$balance_of`, `$erc20_*`, `$is_contract`,
+/// `$is_eoa`) plus pure helpers (`$now_ts`, `$pow`, `$b32int2addr`,
+/// `$is_approved_token`, …).
+///
+/// An instance is bound to one chain's RPC endpoint and holds no mutable
+/// state — construct one per check (or reuse it freely; it is `Clone`-cheap:
+/// only a [`reqwest::Client`] handle and an `Option<String>`).
+///
+/// There are deliberately no price-feed or scam builtins here: embeddings
+/// provide them via a composite
+/// [`BuiltinProvider`](weituo_expr::context::BuiltinProvider) passed to
+/// [`crate::checker::Checker::with_builtins_factory`].
 pub struct Builtins {
     http: reqwest::Client,
-    rpc: Arc<RwLock<HashMap<u64, String>>>,
-    /// Active rules backend; the RPC-URL fallback reuses its engine contract
-    /// (`fetch_chain_info`) so paths and auth live in one place per provider.
-    provider: Arc<dyn RuleProvider>,
-}
-
-fn rpc_urls(settings: &Settings) -> HashMap<u64, String> {
-    settings
-        .rpc
-        .providers
-        .iter()
-        .filter_map(|(key, value)| key.parse().ok().map(|id| (id, value.clone())))
-        .collect()
+    /// RPC endpoint for the bound chain. `None` = unknown — RPC-backed
+    /// builtins error when a rule uses them.
+    rpc_url: Option<String>,
 }
 
 impl Builtins {
-    pub fn new(
-        settings: Settings,
-        http: reqwest::Client,
-        provider: Arc<dyn RuleProvider>,
-    ) -> Arc<Self> {
-        let rpc_urls = rpc_urls(&settings);
-        Arc::new(Self {
-            http,
-            rpc: Arc::new(RwLock::new(rpc_urls)),
-            provider,
-        })
-    }
-
-    pub fn set_rpc_url(&self, chain_id: u64, url: String) {
-        let rpc = Arc::clone(&self.rpc);
-        tokio::spawn(async move {
-            rpc.write().await.insert(chain_id, url);
-        });
+    pub const fn new(http: reqwest::Client, rpc_url: Option<String>) -> Self {
+        Self { http, rpc_url }
     }
 
     pub async fn call(&self, name: &str, args: &[Value], ctx: &EvalContext) -> Result<Value> {
@@ -110,27 +91,10 @@ impl Builtins {
         }
     }
 
-    /// Resolve RPC URL for a chain: local config override first, then the
-    /// active backend's engine contract `/waf/chains` (docs/openapi.yaml)
-    /// via the shared RuleProvider — path and auth live in the provider.
-    async fn rpc_url(&self, ctx: &EvalContext) -> Option<String> {
-        // 1. Check local cache (populated from config override or prior fetch)
-        if let Some(url) = self.rpc.read().await.get(&ctx.chain_id).cloned() {
-            return Some(url);
-        }
-
-        // 2. Fetch through the active provider (same request it always issues
-        // for chain info; an empty rpc_url means "unknown" → no caching).
-        let url: Option<String> = async {
-            let info = self.provider.fetch_chain_info(ctx.chain_id).await.ok()?;
-            (!info.rpc_url.is_empty()).then_some(info.rpc_url)
-        }
-        .await;
-
-        if let Some(ref u) = url {
-            self.rpc.write().await.insert(ctx.chain_id, u.clone());
-        }
-        url
+    /// The RPC endpoint this instance was constructed with. The caller
+    /// resolves it (per chain) when building the checker's builtin provider.
+    fn rpc_url(&self, _ctx: &EvalContext) -> Option<String> {
+        self.rpc_url.clone()
     }
 
     /// POST a JSON-RPC `method` with `params` to the chain's RPC URL and return the
@@ -138,7 +102,6 @@ impl Builtins {
     async fn rpc_call(&self, ctx: &EvalContext, method: &str, params: Json) -> Result<Json> {
         let url = self
             .rpc_url(ctx)
-            .await
             .ok_or_else(|| anyhow!("no RPC for chain {}", ctx.chain_id))?;
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         Ok(self
@@ -306,38 +269,11 @@ impl BuiltinProvider for Builtins {
 #[cfg(test)]
 mod tests {
     use super::{normalize_block_fields, Builtins};
-    use crate::config::Settings;
-    use crate::provider::{ChainInfo, RuleProvider};
     use serde_json::{json, Value as Json};
-    use std::{collections::HashMap, path::Path, sync::Arc};
     use weituo_expr::{eval::Value, EvalContext};
 
-    struct NoopProvider;
-
-    #[async_trait::async_trait]
-    impl RuleProvider for NoopProvider {
-        async fn fetch_chain_info(&self, _chain_id: u64) -> anyhow::Result<ChainInfo> {
-            Ok(ChainInfo {
-                rpc_url: String::new(),
-            })
-        }
-
-        async fn fetch_contract_rules(
-            &self,
-            _chain_id: u64,
-            _address: &str,
-        ) -> anyhow::Result<HashMap<String, crate::types::RuleEntry>> {
-            Ok(HashMap::new())
-        }
-    }
-
-    fn settings() -> Settings {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.toml");
-        Settings::load_from(path.to_str().unwrap()).unwrap()
-    }
-
-    fn builtins() -> Arc<Builtins> {
-        Builtins::new(settings(), reqwest::Client::new(), Arc::new(NoopProvider))
+    fn builtins(rpc_url: Option<&str>) -> Builtins {
+        Builtins::new(reqwest::Client::new(), rpc_url.map(str::to_string))
     }
 
     fn eval_context() -> EvalContext {
@@ -346,15 +282,24 @@ mod tests {
 
     #[tokio::test]
     async fn price_of_is_no_longer_a_core_builtin() {
-        // Price/scam data moved to the embedding layer (see weituo `oracle`
-        // module); core must no longer answer `$price_of` / `$is_scam`.
+        // Price/scam data moved to the embedding layer; core must no longer
+        // answer `$price_of` / `$is_scam`.
         for name in ["price_of", "is_scam", "is_scam_addr"] {
-            let error = builtins()
+            let error = builtins(None)
                 .call(name, &[Value::Str("0x0".into())], &eval_context())
                 .await
                 .unwrap_err();
             assert_eq!(error.to_string(), format!("unknown builtin: ${name}"));
         }
+    }
+
+    #[tokio::test]
+    async fn rpc_builtins_error_without_an_rpc_url() {
+        let error = builtins(None)
+            .call("is_contract", &[Value::Str("0x0".into())], &eval_context())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "no RPC for chain 1");
     }
 
     #[test]
@@ -415,95 +360,5 @@ mod tests {
     fn null_result_stays_null() {
         let block = normalize_block_fields(Json::Null);
         assert!(block.is_null());
-    }
-
-    /// Fallback tests for the builtins RPC resolver: path/auth selection is
-    /// the provider's job (covered by the provider http tests) — here we pin
-    /// the builtins-side contract: consult the provider, cache, and treat an
-    /// empty rpc_url as "unknown".
-    mod rpc_fallback {
-        use super::super::Builtins;
-        use crate::config::Settings;
-        use crate::provider::{ChainInfo, RuleProvider};
-        use crate::types::RuleEntry;
-        use anyhow::Result;
-        use async_trait::async_trait;
-        use std::collections::HashMap;
-        use std::path::Path;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        use weituo_expr::EvalContext;
-
-        /// Stub provider answering fetch_chain_info from `rpc_url`; counts calls.
-        struct StubProvider {
-            rpc_url: &'static str,
-            calls: AtomicUsize,
-        }
-
-        #[async_trait]
-        impl RuleProvider for StubProvider {
-            async fn fetch_chain_info(&self, _chain_id: u64) -> Result<ChainInfo> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(ChainInfo {
-                    rpc_url: self.rpc_url.to_string(),
-                })
-            }
-
-            async fn fetch_contract_rules(
-                &self,
-                _chain_id: u64,
-                _address: &str,
-            ) -> Result<HashMap<String, RuleEntry>> {
-                Ok(HashMap::new())
-            }
-        }
-
-        fn builtins_with(provider: Arc<dyn RuleProvider>) -> Arc<Builtins> {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.toml");
-            Builtins::new(
-                Settings::load_from(path.to_str().unwrap()).unwrap(),
-                reqwest::Client::new(),
-                provider,
-            )
-        }
-
-        fn eval_context() -> EvalContext {
-            EvalContext::new(1, "0x0", "0x0")
-        }
-
-        #[tokio::test]
-        async fn consults_provider_once_then_serves_from_cache() {
-            let stub = Arc::new(StubProvider {
-                rpc_url: "https://eth.example/rpc",
-                calls: AtomicUsize::new(0),
-            });
-            let builtins = builtins_with(stub.clone());
-
-            let url = builtins
-                .rpc_url(&eval_context())
-                .await
-                .expect("rpc url from provider");
-            assert_eq!(url, "https://eth.example/rpc");
-
-            let cached = builtins
-                .rpc_url(&eval_context())
-                .await
-                .expect("cached rpc url");
-            assert_eq!(cached, "https://eth.example/rpc");
-            assert_eq!(stub.calls.load(Ordering::SeqCst), 1);
-        }
-
-        #[tokio::test]
-        async fn empty_provider_rpc_url_maps_to_none() {
-            // Mirrors a /waf/chains answer with rpc_url: null (chain enabled,
-            // no RPC configured) — the engine must treat it as "unknown".
-            let stub = Arc::new(StubProvider {
-                rpc_url: "",
-                calls: AtomicUsize::new(0),
-            });
-            let builtins = builtins_with(stub);
-
-            assert!(builtins.rpc_url(&eval_context()).await.is_none());
-        }
     }
 }
