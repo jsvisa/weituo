@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/expr", "crates/core"]
+resolver = "2"
+
+[workspace.lints.clippy]
+missing_const_for_fn = "warn"
+## Warn when nested ifs can be collapsed into `if cond && cond2` (or a
+## combination of `if let` / `is_some_and` / `?`).
+collapsible_if = "warn"
+
+[workspace.package]
+version = "0.2.5"
+license = "MIT"
+repository = "https://github.com/jsvisa/weituo"
+authors = ["weituo team"]
+
+[workspace.dependencies]
+anyhow      = "1"
+thiserror   = "2"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1", features = ["arbitrary_precision"] }
+pest        = "2"
+pest_derive = "2"
+tokio       = { version = "1", features = ["full"] }
+async-recursion = "1"
+tracing     = "0.1"
