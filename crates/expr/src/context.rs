@@ -3,7 +3,8 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 /// The runtime context passed to every expression evaluation.
-/// All fields mirror the Python WafChecker `thing` dict.
+/// Field names are the identifiers rules can reference (`from_address`,
+/// `to_address`, `chainId`, `value`, `args`, …).
 #[derive(Debug, Clone)]
 pub struct EvalContext {
     pub chain_id: u64,

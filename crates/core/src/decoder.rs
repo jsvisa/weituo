@@ -44,7 +44,7 @@ pub fn decode_calldata(
 
     let mut result = HashMap::new();
     for (idx, (input, value)) in abi_item.inputs.iter().zip(values).enumerate() {
-        // Match Python eth_decode.py: use __arg{idx} for unnamed parameters
+        // Unnamed parameters get __arg{idx} keys
         let key = if input.name.is_empty() {
             format!("__arg{idx}")
         } else {
@@ -88,10 +88,9 @@ pub fn decode_args_only(
 fn value_to_json(v: DynSolValue, input: &AbiInput) -> serde_json::Value {
     match v {
         DynSolValue::Address(a) => {
-            // EIP-55 checksum — matches Python web3.py behaviour so rules written
-            // against the Python WAF (checksummed literals) compare equal here.
-            // The evaluator also normalises both sides to lowercase, so rules with
-            // lowercase or any-case literals still work regardless.
+            // EIP-55 checksummed. The evaluator also normalises both sides to
+            // lowercase, so rules with lowercase or any-case literals still
+            // compare equal regardless.
             serde_json::Value::String(a.to_checksum(None))
         }
         DynSolValue::Bool(b) => serde_json::Value::Bool(b),
@@ -117,7 +116,7 @@ fn value_to_json(v: DynSolValue, input: &AbiInput) -> serde_json::Value {
         }
 
         // Tuples: zip decoded fields with component names from the ABI.
-        // Unnamed components get __arg{idx} (matches Python eth_decode.py).
+        // Unnamed components get __arg{idx} keys.
         DynSolValue::Tuple(fields) => {
             if !input.components.is_empty() {
                 let obj = input

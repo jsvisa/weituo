@@ -1,5 +1,5 @@
 //! Integration tests for the weituo-expr crate.
-//! Mirrors the Python rule-engine tests and test_context.py, without network calls.
+//! Covers rule evaluation and context handling, without network calls.
 //! Builtins that require RPC/oracle are mocked via MockBuiltins.
 
 use std::collections::HashMap;
@@ -447,7 +447,7 @@ async fn is_eoa_mocked() {
 }
 
 // ── And-list (multiple expressions, all must pass) ────────────────────────────
-// This mirrors the Python waf list-format expr: ["expr1", "expr2"]
+// List-format rule expr: ["expr1", "expr2"] — each entry evaluated
 // Each is evaluated independently; all must be true to deny
 
 #[tokio::test]

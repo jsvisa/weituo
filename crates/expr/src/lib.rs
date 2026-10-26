@@ -11,7 +11,7 @@ pub use context::{BuiltinProvider, EvalContext};
 pub use eval::{Evaluator, Explain, Value};
 pub use parser::parse;
 
-/// Strip Python-style `# ...` line comments from an expression string.
+/// Strip `# ...` line comments from an expression string.
 /// Respects single- and double-quoted string literals (# inside quotes is kept).
 fn strip_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());

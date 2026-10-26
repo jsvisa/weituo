@@ -335,9 +335,9 @@ pub struct TypedDataRequest {
     pub messages: Option<Vec<serde_json::Value>>,
 }
 
-// ── Rules fetched from waf-admin API ─────────────────────────────────────────
+// ── Rule feed types ──────────────────────────────────────────────────────────
 
-/// One grouped entry from GET /emp/api/v2/defi/waf/rules?chain_id=N
+/// One grouped entry from a rule-provider feed: every rule for one contract.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rule {
     pub address: String,

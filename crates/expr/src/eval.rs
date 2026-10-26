@@ -454,9 +454,9 @@ fn int_arg(v: Option<&Value>, name: &str, arg: &str) -> Result<i64> {
     }
 }
 
-/// `substring(s, start, end)` — byte-based slice with Python-style negative
-/// indices (exclusive `end`). Both bounds are clamped to `[0, len]`; empty
-/// string when `start >= end`.
+/// `substring(s, start, end)` — byte-based slice with negative indices
+/// counting from the end (exclusive `end`). Both bounds are clamped to
+/// `[0, len]`; empty string when `start >= end`.
 fn substring(s: &str, start: i64, end: i64) -> String {
     let len = s.len() as i64;
     let norm = |i: i64| if i < 0 { len + i } else { i }.clamp(0, len);

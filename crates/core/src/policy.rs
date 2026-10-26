@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 /// Policy for ERC20 `transfer` / `approve` calls that have no matching rule.
 ///
-/// Scam screening (`deny_scam` in the hosted service) is deliberately **not**
+/// Scam screening is deliberately **not**
 /// part of core: the embedding layer decodes the approve spender itself,
 /// consults its own scam list and denies before invoking the checker — the
 /// engine stays free of any scam concept.

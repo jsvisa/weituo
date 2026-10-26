@@ -1,6 +1,7 @@
 /// Loads WAF rules from a local waf.yaml + per-selector ABI files.
 ///
-/// Used by static mode to populate `RuleManager` without contacting waf-admin.
+/// For embedders that ship rules as files instead of fetching them from a
+/// rule provider.
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -63,7 +64,7 @@ struct YamlRule {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Parse `rules_path` (waf.yaml) and its companion `abi_dir` into data structures
-/// ready to be loaded into `RuleManager::load_static()`.
+/// ready to build a `StaticResolver` or feed a custom rule cache.
 ///
 /// Returns:
 ///   - `chains`: one `ChainInfo` per chain found in the file (rpc_url = "")
