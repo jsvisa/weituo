@@ -115,7 +115,15 @@ cargo test --workspace --all-features
 
 ## Publishing
 
-Publish in dependency order; run each dry run first:
+Releases are tag-driven: push a tag matching the workspace version and CI
+publishes both crates (`weituo-expr` first, then `weituo-core`). The tag must
+match the `version` in the root `Cargo.toml`.
+
+```sh
+git tag v0.2.5 && git push origin v0.2.5
+```
+
+To publish manually instead, go in dependency order; run each dry run first:
 
 ```sh
 cargo publish --dry-run -p weituo-expr
