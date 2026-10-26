@@ -1,0 +1,77 @@
+// rule_engine DSL grammar
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+// Atomic keyword tokens
+kw_and   = @{ "and"            ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_or    = @{ "or"             ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_not   = @{ "not"            ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_in    = @{ "in"             ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_true  = @{ "true"           ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_false = @{ "false"          ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_null  = @{ ("null" | "None") ~ !(ASCII_ALPHANUMERIC | "_") }
+keyword  = _{ kw_and | kw_or | kw_not | kw_in | kw_true | kw_false | kw_null }
+
+// ── Top-level ────────────────────────────────────────────────────────────────
+expr     = { or_expr ~ EOI }
+or_expr  = { and_expr  ~ (kw_or  ~ and_expr)* }
+and_expr = { not_expr  ~ (kw_and ~ not_expr)* }
+not_expr = { kw_not ~ not_expr | cmp_expr }
+
+// ── Comparisons & membership ──────────────────────────────────────────────────
+cmp_expr = { shift_expr ~ (in_op ~ array_lit | cmp_op ~ shift_expr)? }
+
+cmp_op = { "==" | "!=" | "<=" | ">=" | "<" | ">" | "=~" }
+in_op  = { kw_not ~ kw_in | kw_in }
+
+// ── Arithmetic ───────────────────────────────────────────────────────────────
+shift_op   = { "<<" | ">>" }
+add_op     = { "+" | "-" }
+mul_op     = { "*" | "/" | "%" }
+shift_expr = { add_expr ~ (shift_op ~ add_expr)* }
+add_expr   = { mul_expr ~ (add_op ~ mul_expr)* }
+mul_expr   = { unary   ~ (mul_op ~ unary)* }
+neg_op   = { "-" }
+unary    = { neg_op ~ unary | primary }
+
+// ── Primaries ────────────────────────────────────────────────────────────────
+primary = {
+    builtin_call
+  | func_call
+  | bool_lit
+  | null_lit
+  | attribute
+  | float
+  | integer
+  | string
+  | "(" ~ or_expr ~ ")"
+}
+
+builtin_call = { "$" ~ ident ~ "(" ~ call_args ~ ")" ~ attr_tail* }
+func_call    = { !keyword ~ ident ~ "(" ~ call_args ~ ")" }
+call_args    = { (or_expr ~ ("," ~ or_expr)*)? }
+
+// Attribute / index access: ident followed by any mix of .field and [integer]
+// e.g. args.to, args._amounts[0], args.swap.path[2].token
+attribute  = { !keyword ~ ident ~ attr_tail* }
+attr_tail  = { attr_dot | attr_index }
+attr_dot   = { "." ~ ident }
+attr_index = { "[" ~ attr_idx ~ "]" }
+attr_idx   = @{ ASCII_DIGIT+ }
+
+// .length on arrays (shorthand: args.field.length)
+// Handled in evaluator by checking if accessed key == "length" on an array.
+
+ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// ── Literals ─────────────────────────────────────────────────────────────────
+literal  = { float | integer | string | bool_lit | null_lit }
+float    = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* ~ (("e"|"E") ~ ("+"| "-")? ~ ASCII_DIGIT+)?
+            | "-"? ~ ASCII_DIGIT+ ~ ("e"|"E") ~ ("+"| "-")? ~ ASCII_DIGIT+ }
+integer  = @{ "-"? ~ ASCII_DIGIT+ }
+string   = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" | "'" ~ (!"'" ~ ANY)* ~ "'" }
+bool_lit = { kw_true | kw_false }
+null_lit = { kw_null }
+
+// ── Array literal ['a', 'b'] or [1, 2, 3] ────────────────────────────────────
+array_element = { attribute | literal }
+array_lit     = { "[" ~ (array_element ~ ("," ~ array_element)*)? ~ "]" }

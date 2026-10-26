@@ -1,0 +1,35 @@
+[package]
+name = "weituo-core"
+version.workspace = true
+edition = "2021"
+description = "Reusable EVM WAF rule-check engine: rules, DSL builtins, checker (no HTTP server)"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["waf", "ethereum", "evm", "security", "rules"]
+categories = ["web-programming", "cryptography::cryptocurrencies"]
+
+[lints]
+workspace = true
+
+[dependencies]
+weituo-expr      = { path = "../expr", version = "0.2.5" }
+anyhow           = { workspace = true }
+thiserror        = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tokio            = { workspace = true }
+tracing          = { workspace = true }
+async-trait      = "0.1"
+arc-swap         = "1"
+dashmap          = "6"
+alloy-dyn-abi    = "1"
+alloy-primitives = "1"
+hex              = "0.4"
+reqwest          = { version = "0.12", features = ["json"] }
+serde_yaml       = "0.9"
+config           = "0.15"
+
+[dev-dependencies]
+tempfile = "3"
