@@ -65,6 +65,9 @@ impl Checker {
     pub async fn check(&self, tx: &Transaction, r: &dyn RuleResolver) -> CheckResult;
     /// New unified entry point.
     pub async fn check_tx(&self, tx: &ChainTx, r: &dyn ChainResolver) -> CheckResult;
+    /// Unified test-mode preview (mirrors `test`): inline `abi` on `SvmTx` /
+    /// `SuiTx` plays the role of `Transaction.abi` today.
+    pub async fn test_tx(&self, tx: &ChainTx, r: Option<&dyn ChainResolver>) -> CheckResult;
 }
 
 // 2.4 New resolver trait. NOT a blanket impl (that would forbid a type from
@@ -96,16 +99,22 @@ internally, so **embedders never see the adapter**.
 | `StaticResolver::new(HashMap<(u64, String), …>)` | untouched |
 | EVM YAML rule files (`chain_id:` key) | untouched |
 | Their HTTP `waf_*` service code for EVM txs | untouched |
-| `EvalContext` literal construction | **one field added** (`chain_fields`, §6) — minor-break, ships with constructors + `0.3.0` |
+| `EvalContext` literal construction | **two fields added** (`network`, `chain_fields` — §6) — minor-break, ships with constructors + `0.3.0` |
 | `with_builtins_factory` | kept; new `with_chain_builtins_factory` added alongside (§7) |
 
 Versioning: ships as `0.3.0` of both crates.
 
 ## 3. JSON wire format
 
-A top-level `"chain"` discriminator selects the family. **Absent `chain` +
-EVM-shaped payload parses as `ChainTx::Evm`** — today's payloads are
-byte-identical.
+A top-level `"chain"` discriminator selects the family. Parsing rules:
+
+- **Absent `chain` → legacy EVM parse** (strict `chainId`/`to`/`data`
+  requirements as today) — today's payloads are byte-identical. An
+  `instructions`-shaped payload *without* `chain` therefore fails the EVM
+  parser's missing-field checks: fail-closed.
+- SVM and Sui payloads **require** an explicit `chain` value and a string
+  `chainId` (network name); a numeric `chainId` combined with
+  `chain: "svm" | "sui"` is rejected.
 
 ### 3.1 EVM (unchanged)
 
@@ -205,7 +214,10 @@ Family-specific normalization:
 | Sui | one call per command; non-MoveCall commands handled by the policy layer or the native-transfer dataflow pass (§8.3) |
 
 This collapses the existing `step_multicall` / `check_one_inner` machinery
-and the new families into a single path.
+and the new families into a single path. EVM multicall semantics (per-inner
+rule lookup, `invalid_decoder`, Universal Router dispatch) are preserved
+exactly — phase 1 captures characterization tests for those paths *before*
+the refactor (§10).
 
 ## 5. Rules: YAML format and rule keys
 
@@ -229,13 +241,14 @@ contracts:
         abi: { name: "swap", args: [{name: "amount", type: "u64"}, …] }  # Anchor IDL fragment
         expr: "args.amount <= vars.max_notional"
 
-  # sui — func is "module::function" (lowercase), abi is a Move signature
+  # sui — func is "module::function" (lowercase), abi is a named Move signature
   - chain: "sui:mainnet"
     address: "0x…package…"
     allowlist:
       - func: "pay::split"
-        abi: { parameters: ["0x2::coin::Coin<0x2::sui::SUI>", "u64"] }
-        expr: "args.amount_1 <= vars.max_sui"
+        abi: { params: [{name: "coin", type: "0x2::coin::Coin<0x2::sui::SUI>"},
+                        {name: "split_at", type: "u64"}] }
+        expr: "args.split_at <= vars.max_sui"
 ```
 
 Selector keys per family:
@@ -243,7 +256,7 @@ Selector keys per family:
 | Family | selector key | how computed |
 | --- | --- | --- |
 | EVM | `0x` + 4-byte keccak hex | `selector_for` (today) |
-| SVM | `0x` + 8-byte discriminator hex | `sha256("global:" + snake_case(func))[..8]`; non-anchor rules use the raw `func` hex they already provide |
+| SVM | `0x` + discriminator bytes | Anchor: `sha256("global:" + snake_case(func))[..8]`; non-Anchor: `func` as a hex **prefix** (1–8 bytes) matched against the instruction-data prefix (covers SPL tags like `0x0c`); lookup tries the full 8-byte key first, then shorter prefixes |
 | Sui | `"module::function"` lowercase | as written in YAML |
 
 Notes:
@@ -255,9 +268,84 @@ Notes:
   the same convention applies with `::` → `__` in file names
   (`pay__split.json`); inline `abi:` in YAML remains the primary path, as it
   already is for most EVM rules.
-- `RuleKey` internally becomes `(ChainRef, address, selector)`;
-  `StaticResolver`'s existing `(u64, String)` constructor is retained and
-  routes to `ChainRef::Evm`.
+- `RuleKey` internally becomes `(ChainRef, address, selector)`.
+  `static_loader::load` keeps its exact signature and delegates to a new
+  `load_multi` (same YAML surface, `ChainRef`-keyed maps); the legacy
+  `StaticResolver::new(HashMap<(u64, String), …>)` constructor is retained
+  and routes to `ChainRef::Evm`.
+- **Sui upgradeability**: publishing an upgrade mints a *new* package id, so
+  rules keyed by package address are silently orphaned. Rule authors should
+  target immutable packages (or pin versions) — the engine cannot detect the
+  drift.
+
+### 5.1 Authoring rules per family (examples)
+
+The expression language is identical on every family — same operators, same
+`vars`, same `in`/indexing. Only the `args.*` namespace and context
+identifiers differ.
+
+**EVM** — `args` = decoded calldata params (today, unchanged):
+
+```yaml
+- func: "transfer(address,uint256)"
+  expr: "args.to in vars.my_wallets and args.value <= vars.max_usdt"
+```
+
+**SVM** — `args` = borsh-decoded Anchor params **plus** the instruction's
+account list (`args.accounts`). The key difference from EVM: for SPL token
+transfers the recipient/mint live in the *accounts*, not in borsh args.
+
+```yaml
+# Anchor program: borsh args by param name; to_address == program id
+- func: "swap"
+  expr: "args.amount <= vars.max_notional"
+
+# Non-Anchor program (SPL Token TransferChecked, data tag 0x0c): a hex
+# `func` prefix matches the instruction-data prefix. TransferChecked
+# accounts = [source, mint, destination, owner]:
+- func: "0x0c"
+  abi: { args: [{name: "amount", type: "u64"}, {name: "decimals", type: "u8"}] }
+  expr: "args.accounts[1] == vars.usdc_mint
+         and args.accounts[2] in vars.my_wallets
+         and args.amount <= vars.max_usdc"
+
+# Native SOL transfer (System::Transfer, tag 0x02): recipient is accounts[1]
+- func: "0x02"
+  abi: { args: [{name: "lamports", type: "u64"}] }
+  expr: "args.accounts[1] in vars.my_wallets and args.lamports <= vars.max_sol"
+```
+
+**Sui** — `args` = BCS-decoded pure inputs by param name; object params
+become object-id strings; generic functions expose `args.type_arguments`;
+reference params (`&mut TxContext` etc.) are filtered before positional
+mapping:
+
+```yaml
+# pay::split<T>(coin: Coin<T>, split_at: u64, ctx) — refs filtered, so
+# args = {coin: "<object id>", split_at: <u64>} + type_arguments
+- func: "pay::split"
+  abi: { params: [{name: "coin", type: "0x2::coin::Coin<T>"},
+                  {name: "split_at", type: "u64"}] }
+  expr: "args.type_arguments[0] == '0x5d4b…::usdc::USDC'
+         and args.split_at <= vars.max_usdc"
+```
+
+The **native SUI transfer** (SplitCoins+TransferObjects, or `pay_sui`) is
+normalized to a synthetic call under the system package with selector
+`native_transfer`, so recipient allowlists work exactly like EVM `receive()`
+rules:
+
+```yaml
+- chain: "sui:mainnet"
+  address: "0x2"
+  allowlist:
+    - func: "native_transfer"
+      expr: "args.recipient in vars.my_wallets and args.amount <= vars.max_sui"
+```
+
+Context identifiers available on every family: `from_address` (fee payer /
+sender), `to_address` (program id / package), `chainId`, `network`, plus the
+`chain_fields` extras of §6. `vars` are rule-level constants, unchanged.
 
 ## 6. `EvalContext` and DSL changes
 
@@ -268,7 +356,8 @@ pub struct EvalContext {
     pub value: U256,          // EVM wei; SVM/Sui → 0 (native amounts live in args)
     pub args, from_address, to_address, gas_price, gas_limit, vars
     // new:
-    pub network: String,      // "eip155:1" / "mainnet-beta" / "mainnet"
+    pub network: String,      // family-prefixed, == ChainRef::to_family_network():
+                              // "eip155:1" / "svm:mainnet-beta" / "sui:mainnet"
     pub chain_fields: HashMap<String, serde_json::Value>,  // family-specific extras
 }
 ```
@@ -281,18 +370,30 @@ per-family profile):
 | `from_address` | sender | fee payer | sender |
 | `to_address` | contract | **program id of the current instruction** | **package of the current MoveCall** |
 | `chainId` | num (EIP-155) | str (network name) | str (network name) |
-| `network` | str | str | str |
+| `network` | str, family-prefixed | str, family-prefixed | str, family-prefixed |
 | `value`, `gasPrice`, `gasLimit` | num | n/a (0) — SVM exposes `lamports` per-arg; Sui exposes `gasBudget`/`gasPrice` via chain_fields | n/a (0) |
-| family extras via `chain_fields` | — | `instruction_index`, `num_instructions` (num) | `command_index`, `num_commands`, `command_kind`, `gas_budget`, `gas_price` |
+| family extras via `chain_fields` | — | `instruction_index`, `num_instructions` (num), `signers` (str list) | `command_index`, `num_commands`, `command_kind`, `gas_budget`, `gas_price` |
 
 `chain_fields` is a new `EvalContext` field; bare identifiers resolve through
 the family profile first, then `chain_fields`. Rule-load-time validation
 (`analyze`) rejects references to fields the family does not define — a rule
 using `$erc20_*` on an SVM contract fails at load, not at check time.
+Sponsored flows: SVM `from_address` is the fee payer, which on a sponsored
+tx differs from the instruction authority — `chain_fields.signers` exposes
+the full signer list (v1 does not model per-instruction authority). Sui
+sponsorship is explicit in the payload (`gasOwner`); `from_address` stays
+the sender.
 
 Address literal validation per family: EVM 20-byte hex (alloy, today);
 SVM base58-decodable, 32 bytes, length ≤ 44; Sui variable-length hex parsing
 to exactly 32 bytes.
+
+Sui addresses compare as **full 64-nibble lowercase hex**. Args are
+normalized at decode time; rule `vars` and expression string literals must
+use the same full form — a literal `'0x2'` will not match the system
+package (`0x0000…0002`). The engine cannot rewrite embedding-owned `vars`,
+so this is a documented convention, and the rule-load validator warns on
+short Sui address literals.
 
 ## 7. Builtin sets
 
@@ -307,7 +408,7 @@ stay stable across families so simple rules port unchanged:
 | `$block()` / `$gas_price` | ✓ | — (fail at load) | — (fail at load) |
 | `$erc20_*` | ✓ | — (fail at load) | — |
 | `$spl_balance_of(token_mint, owner)` | — | getTokenAccountsByOwner (jsonParsed) | — |
-| `$spl_allowance(mint, owner, delegate)` | — | token-account `delegate` field | — |
+| `$spl_allowance(mint, owner, delegate)` | — | token-account `delegate`/`delegated_amount`; an owner may hold several accounts per mint, so v1 scans all of the owner's accounts for that mint and takes the max match | — |
 | `$coin_balance(owner, coin_type)` | — | — | sui_getBalance(coinType) |
 | `$b32int2addr` | ✓ | — | — |
 | `$price_of`, `$is_scam`, `$is_approved_token/spender`, `$is_not_blocked_spender` | embedding-provided | embedding-provided | embedding-provided |
@@ -350,14 +451,21 @@ rule's IDL fragment), so both are **hand-rolled byte-slice decoders** — no
   verbatim (covers non-Anchor programs and hand-written rules).
 - Synthetic arg: every SVM call also exposes `args.accounts`
   (`Vec<base58>`) — the instruction's resolved account keys — registered in
-  the param map so `analyze` accepts it (type `pubkey[]`).
+  the param map so `analyze` accepts it (type `pubkey[]`). An IDL declaring
+  a literal `accounts` argument collides; the loader rejects the rule with
+  a clear error rather than shadowing.
 
 ### 8.2 Sui: Move signatures + BCS
 
 - Rule ABI fragment: `{ parameters: [type-string] }` using normalized Move
   type syntax (`u64`, `address`, `bool`, `vector<T>`, `0x2::coin::Coin<T>`,
   `Option<T>`, `string`).
-- Decoding `MoveCall` arguments positionally:
+- Decoding `MoveCall` arguments positionally against the function signature,
+  **after filtering out reference parameters**: `&T` / `&mut T` params —
+  always including the trailing `&mut 0x2::tx_context::TxContext` — are
+  implicit in PTB arguments and consume no argument slot. Skipping this
+  filter misaligns every subsequent argument. Parameter names come from the
+  rule's ABI fragment; unnamed params fall back to `__arg{i}` (as in EVM).
   - `{"Input": i}` + pure input → BCS-decode with the parameter's type:
     LE ints, `address` = 32 raw bytes (rendered full-hex), `vector<T>` =
     ULEB128 length prefix, `string` = `vector<u8>`, option = tag byte.
@@ -368,6 +476,13 @@ rule's IDL fragment), so both are **hand-rolled byte-slice decoders** — no
     `null`, and the rule-load validator **rejects rules that reference a
     parameter receiving an inter-command result** unless the command pair is
     recognized by the native-transfer pass (§8.3). Fail-closed.
+- Generic functions expose `args.type_arguments` (canonicalized full-form
+  type strings), so rules can pin the coin type:
+  `args.type_arguments[0] == '0x5d4b…::usdc::USDC'`.
+- Move type strings arrive in two renderings (inline rule fragments like
+  `u64`; normalized-function output like `U64`). A small normalizer
+  canonicalizes primitives, addresses inside generics, and whitespace so
+  both sources produce identical selectors and decode identically.
 - Move signature source: inline in the rule (primary), or fetched via
   `sui_getNormalizedMoveFunction` by the embedding layer and fed inline.
 
@@ -388,7 +503,11 @@ to the fail-closed rule of §8.2. General dataflow is future work.
 
 ## 9. Policy mapping
 
-`Policy` fields map per family:
+`Policy` fields map per family. **Gate order is identical on every family**:
+allowlist → creation gate → native-transfer gate → token-op gate (only when
+rule lookup fails) → rule lookup. On Sui, `pay_sui` / `split` over the gas
+coin are consumed by the native-transfer gate first (§8.3); the same targets
+over a non-gas coin fall through to the token-op gate.
 
 | Policy field | evm (today) | svm | sui |
 | --- | --- | --- | --- |
@@ -402,19 +521,23 @@ families unchanged.
 
 ## 10. Testing plan
 
-- **EVM regression is the gate for phase 1**: the full existing test suite
-  must pass unchanged, plus new tests proving `check` ≡ `check_tx(Evm(tx))`.
-- SVM golden vectors: hand-encoded borsh payloads for System::Transfer,
-  SPL TransferChecked/ApproveChecked, and an Anchor call (discriminator
-  computed via `sha2` in-test); a v0-message shape with a resolved ALT to
-  pin index-order semantics.
+- **EVM regression is the gate for phase 1**: characterization tests for the
+  Multicall3 / BytesArray / ParallelArrays / UniversalRouter paths are
+  captured *before* the refactor; afterwards the full existing suite must
+  pass unchanged, plus new tests proving `check` ≡ `check_tx(Evm(tx))`.
+- SVM golden vectors: real mainnet fixtures (System::Transfer, SPL
+  TransferChecked/ApproveChecked, an Anchor call with the discriminator
+  computed via `sha2` in-test) with accounts **pre-resolved in the fixture**
+  — core never sees indexes or ALTs, so tests pin the resolved-list
+  contract, not index-order semantics.
 - Sui golden vectors: the §3.3 PTB (SplitCoins + TransferObjects with
   `Result(0)` dataflow), a plain `coin::transfer` MoveCall, a `Publish`
   policy denial, variable-length addresses (`0x2`) normalized against
   full-hex rule keys.
-- Fail-closed tests: SVM instruction with accounts below/above the resolved
-  count, Sui rule referencing an unresolvable `Result`, unknown builtin per
-  family rejected at load.
+- Fail-closed tests: SVM instruction whose borsh payload runs out of bytes
+  mid-argument or whose IDL references an unresolvable `defined` type, Sui
+  rule referencing an unresolvable `Result`, unknown builtin per family
+  rejected at load.
 
 ## 11. Phases
 
@@ -424,10 +547,10 @@ families unchanged.
    EVM-only, fully green.
 2. **SVM** (feature `svm`) — `SvmTx` + JSON deser, discriminator computation,
    hand-rolled borsh decoder + IDL plumbing, `SvmBuiltins`, policy mapping,
-   golden vectors.
+   `test_tx` with inline ABI, golden vectors.
 3. **Sui** (feature `sui`) — `SuiTx` + JSON deser, hand-rolled BCS decoder,
-   native-transfer dataflow pass, `SuiBuiltins`, policy mapping, golden
-   vectors.
+   native-transfer dataflow pass, `SuiBuiltins`, policy mapping, `test_tx`
+   with inline Move signatures, golden vectors.
 4. **Polish** — README + `embed_checker` multi-chain example, `0.3.0` bump,
    CI matrix (EVM-only build with `--no-default-features`).
 
@@ -445,3 +568,8 @@ with `default-features = false`.
 - SVM on-chain reads beyond balance/program checks (e.g. `simulateTransaction`
   as an `$svm_simulate` escape hatch).
 - Sui checkpoint-based `$block()` analog.
+- Cross-instruction / cross-command aggregate constraints (e.g. "total SVM
+  lamports out across all instructions", "total SUI out across the PTB") —
+  v1 checks each call independently.
+- Sui object-input metadata (type/owner of referenced objects) for rules —
+  v1 exposes only the object id string.
