@@ -291,9 +291,11 @@ identifiers differ.
   expr: "args.to in vars.my_wallets and args.value <= vars.max_usdt"
 ```
 
-**SVM** — `args` = borsh-decoded Anchor params **plus** the instruction's
-account list (`args.accounts`). The key difference from EVM: for SPL token
-transfers the recipient/mint live in the *accounts*, not in borsh args.
+**SVM** — `args` = borsh-decoded Anchor params, exclusively. The
+instruction's resolved account list is a separate context identifier
+`accounts` (never an arg, so an IDL arg named `accounts` cannot collide).
+The key difference from EVM: for SPL token transfers the recipient/mint
+live in the *accounts*, not in borsh args.
 
 ```yaml
 # Anchor program: borsh args by param name; to_address == program id
@@ -305,20 +307,21 @@ transfers the recipient/mint live in the *accounts*, not in borsh args.
 # accounts = [source, mint, destination, owner]:
 - func: "0x0c"
   abi: { args: [{name: "amount", type: "u64"}, {name: "decimals", type: "u8"}] }
-  expr: "args.accounts[1] == vars.usdc_mint
-         and args.accounts[2] in vars.my_wallets
+  expr: "accounts[1] == vars.usdc_mint
+         and accounts[2] in vars.my_wallets
          and args.amount <= vars.max_usdc"
 
 # Native SOL transfer (System::Transfer, tag 0x02): recipient is accounts[1]
 - func: "0x02"
   abi: { args: [{name: "lamports", type: "u64"}] }
-  expr: "args.accounts[1] in vars.my_wallets and args.lamports <= vars.max_sol"
+  expr: "accounts[1] in vars.my_wallets and args.lamports <= vars.max_sol"
 ```
 
 **Sui** — `args` = BCS-decoded pure inputs by param name; object params
-become object-id strings; generic functions expose `args.type_arguments`;
-reference params (`&mut TxContext` etc.) are filtered before positional
-mapping:
+become object-id strings; reference params (`&mut TxContext` etc.) are
+filtered before positional mapping. Generic functions expose their type
+arguments as a separate context identifier `type_arguments` (also never an
+arg):
 
 ```yaml
 # pay::split<T>(coin: Coin<T>, split_at: u64, ctx) — refs filtered, so
@@ -326,7 +329,7 @@ mapping:
 - func: "pay::split"
   abi: { params: [{name: "coin", type: "0x2::coin::Coin<T>"},
                   {name: "split_at", type: "u64"}] }
-  expr: "args.type_arguments[0] == '0x5d4b…::usdc::USDC'
+  expr: "type_arguments[0] == '0x5d4b…::usdc::USDC'
          and args.split_at <= vars.max_usdc"
 ```
 
@@ -344,8 +347,11 @@ rules:
 ```
 
 Context identifiers available on every family: `from_address` (fee payer /
-sender), `to_address` (program id / package), `chainId`, `network`, plus the
-`chain_fields` extras of §6. `vars` are rule-level constants, unchanged.
+sender), `to_address` (program id / package), `chainId`, `network`; per-call
+synthetic data lives in family context identifiers too — `accounts` (SVM)
+and `type_arguments` (Sui) — **not** in `args`. `args.*` therefore contains
+only IDL-decoded parameters, which makes the namespace collision-free by
+construction. `vars` are rule-level constants, unchanged.
 
 ## 6. `EvalContext` and DSL changes
 
@@ -372,12 +378,15 @@ per-family profile):
 | `chainId` | num (EIP-155) | str (network name) | str (network name) |
 | `network` | str, family-prefixed | str, family-prefixed | str, family-prefixed |
 | `value`, `gasPrice`, `gasLimit` | num | n/a (0) — SVM exposes `lamports` per-arg; Sui exposes `gasBudget`/`gasPrice` via chain_fields | n/a (0) |
-| family extras via `chain_fields` | — | `instruction_index`, `num_instructions` (num), `signers` (str list) | `command_index`, `num_commands`, `command_kind`, `gas_budget`, `gas_price` |
+| family extras via `chain_fields` | — | `instruction_index`, `num_instructions`, `signers` (str list), `accounts` (str list) | `command_index`, `num_commands`, `command_kind`, `gas_budget`, `gas_price`, `type_arguments` (str list) |
 
 `chain_fields` is a new `EvalContext` field; bare identifiers resolve through
-the family profile first, then `chain_fields`. Rule-load-time validation
-(`analyze`) rejects references to fields the family does not define — a rule
-using `$erc20_*` on an SVM contract fails at load, not at check time.
+the family profile first, then `chain_fields` — through the same attribute
+machinery as `args`, so `accounts[1]`, `accounts.length`,
+`type_arguments[0]` all work. Rule-load-time validation (`analyze`) rejects
+references to fields the family does not define — a rule using `$erc20_*`
+on an SVM contract fails at load, not at check time, and a bare `accounts`
+on an EVM rule is rejected the same way.
 Sponsored flows: SVM `from_address` is the fee payer, which on a sponsored
 tx differs from the instruction authority — `chain_fields.signers` exposes
 the full signer list (v1 does not model per-instruction authority). Sui
@@ -449,11 +458,11 @@ rule's IDL fragment), so both are **hand-rolled byte-slice decoders** — no
 - Discriminator: `sha256("global:" + snake_case(name))[..8]` computed at
   rule load (new dep `sha2`). When a rule's `func` is already hex, it is used
   verbatim (covers non-Anchor programs and hand-written rules).
-- Synthetic arg: every SVM call also exposes `args.accounts`
-  (`Vec<base58>`) — the instruction's resolved account keys — registered in
-  the param map so `analyze` accepts it (type `pubkey[]`). An IDL declaring
-  a literal `accounts` argument collides; the loader rejects the rule with
-  a clear error rather than shadowing.
+- Synthetic context (NOT an arg): every SVM call exposes the instruction's
+  resolved account keys as the context identifier `accounts`
+  (`Vec<base58>`, indexable, `.length` works). Because it lives outside the
+  `args` namespace, an IDL declaring a borsh argument literally named
+  `accounts` cannot collide — `args.*` is exclusively decoded parameters.
 
 ### 8.2 Sui: Move signatures + BCS
 
@@ -476,9 +485,10 @@ rule's IDL fragment), so both are **hand-rolled byte-slice decoders** — no
     `null`, and the rule-load validator **rejects rules that reference a
     parameter receiving an inter-command result** unless the command pair is
     recognized by the native-transfer pass (§8.3). Fail-closed.
-- Generic functions expose `args.type_arguments` (canonicalized full-form
-  type strings), so rules can pin the coin type:
-  `args.type_arguments[0] == '0x5d4b…::usdc::USDC'`.
+- Generic functions expose their type arguments as the context identifier
+  `type_arguments` (canonicalized full-form type strings, outside `args`
+  for the same collision-free reason as SVM `accounts`), so rules can pin
+  the coin type: `type_arguments[0] == '0x5d4b…::usdc::USDC'`.
 - Move type strings arrive in two renderings (inline rule fragments like
   `u64`; normalized-function output like `U64`). A small normalizer
   canonicalizes primitives, addresses inside generics, and whitespace so
