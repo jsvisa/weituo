@@ -20,6 +20,7 @@
 //! No global state, no background tasks, no config files.
 
 pub mod builtins;
+pub mod chain;
 pub mod checker;
 pub mod decoder;
 pub mod parse_rule;

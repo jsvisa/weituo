@@ -6,6 +6,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::builtins::Builtins;
+use crate::chain::{ChainRef, ChainResolver, ChainTx, CompatResolver};
 use crate::decoder::{build_decoder, decode_args_only, decode_calldata};
 use crate::policy::{Policy, TokenOpPolicy};
 use crate::provider::RuleResolver;
@@ -160,6 +161,29 @@ impl DenyReason {
 pub type BuiltinsFactory =
     Arc<dyn Fn(Option<String>) -> Arc<dyn weituo_expr::context::BuiltinProvider> + Send + Sync>;
 
+/// EvalContext construction for the EVM pipeline: family network string
+/// threaded through so rules can reference `network` (and, on non-EVM
+/// families later, `chain_fields`).
+fn evm_eval_ctx(
+    tx: &Transaction,
+    args: HashMap<String, serde_json::Value>,
+    to_address: &str,
+    vars: HashMap<String, serde_json::Value>,
+) -> EvalContext {
+    EvalContext {
+        chain_id: tx.chain_id,
+        value: tx.value,
+        args,
+        from_address: tx.from.to_lowercase(),
+        to_address: to_address.to_lowercase(),
+        gas_price: tx.gas_price,
+        gas_limit: tx.gas_limit,
+        vars,
+        network: format!("eip155:{}", tx.chain_id),
+        chain_fields: HashMap::new(),
+    }
+}
+
 /// The decision engine. Holds only immutable parameters — construct it once
 /// and call [`Checker::check`] with a [`RuleResolver`] per transaction.
 fn lookup_rules(rules: &HashMap<String, RuleEntry>, selector: &str) -> RuleLookup {
@@ -196,7 +220,7 @@ enum RuleLookup {
 /// Per-check context threaded through the pipeline: where rules come from
 /// and which `$`-builtin provider answers this check's expressions.
 struct CheckCtx<'a> {
-    resolver: &'a dyn RuleResolver,
+    resolver: &'a dyn ChainResolver,
     builtins: &'a Arc<dyn weituo_expr::context::BuiltinProvider>,
 }
 
@@ -237,26 +261,46 @@ impl Checker {
     /// Build the `$`-builtin provider for one check call.
     fn builtins_for(
         &self,
-        resolver: &dyn RuleResolver,
-        chain_id: u64,
+        resolver: &dyn ChainResolver,
+        chain: ChainRef,
     ) -> Arc<dyn weituo_expr::context::BuiltinProvider> {
-        self.builtins_for_opt(Some(resolver), chain_id)
+        self.builtins_for_opt(Some(resolver), chain)
     }
 
     fn builtins_for_opt(
         &self,
-        resolver: Option<&dyn RuleResolver>,
-        chain_id: u64,
+        resolver: Option<&dyn ChainResolver>,
+        chain: ChainRef,
     ) -> Arc<dyn weituo_expr::context::BuiltinProvider> {
-        let rpc_url = resolver.and_then(|r| r.chain_rpc_url(chain_id));
+        let rpc_url = resolver.and_then(|r| r.chain_rpc_url(chain));
         match &self.builtins_factory {
             Some(factory) => factory(rpc_url),
             None => Arc::new(Builtins::new(self.http.clone(), rpc_url)),
         }
     }
 
+    /// Unchanged EVM entry point — delegates to [`Checker::check_tx`] with
+    /// the caller's resolver wrapped in [`CompatResolver`] (embedders never
+    /// see the adapter).
     pub async fn check(&self, tx: &Transaction, resolver: &dyn RuleResolver) -> CheckResult {
-        let builtins = self.builtins_for(resolver, tx.chain_id);
+        self.check_tx(&ChainTx::Evm(tx.clone()), &CompatResolver(resolver))
+            .await
+    }
+
+    /// Unified entry point: policy gates → per-call rule lookup → eval.
+    pub async fn check_tx(&self, tx: &ChainTx, resolver: &dyn ChainResolver) -> CheckResult {
+        let ChainTx::Evm(tx) = tx;
+        self.check_evm(tx, ChainRef::Evm(tx.chain_id), resolver)
+            .await
+    }
+
+    async fn check_evm(
+        &self,
+        tx: &Transaction,
+        chain: ChainRef,
+        resolver: &dyn ChainResolver,
+    ) -> CheckResult {
+        let builtins = self.builtins_for(resolver, chain);
         let ctx = CheckCtx {
             resolver,
             builtins: &builtins,
@@ -366,9 +410,12 @@ impl Checker {
         &self,
         tx: &Transaction,
         selector: &str,
-        resolver: &dyn RuleResolver,
+        resolver: &dyn ChainResolver,
     ) -> Result<RuleEntry, DenyReason> {
-        let Some(rules) = resolver.contract_rules(tx.chain_id, &tx.to).await else {
+        let Some(rules) = resolver
+            .contract_rules(ChainRef::Evm(tx.chain_id), &tx.to)
+            .await
+        else {
             return Err(DenyReason::NoContract {
                 address: tx.to.clone(),
                 chain_id: tx.chain_id,
@@ -411,16 +458,7 @@ impl Checker {
         let mut last_denied = String::new();
         let mut last_failing = None;
         'clauses: for clause in &entry.clauses {
-            let ctx = EvalContext {
-                chain_id: tx.chain_id,
-                value: tx.value,
-                args: args.clone(),
-                from_address: tx.from.to_lowercase(),
-                to_address: tx.to.to_lowercase(),
-                gas_price: tx.gas_price,
-                gas_limit: tx.gas_limit,
-                vars: clause.vars.clone(),
-            };
+            let ctx = evm_eval_ctx(tx, args.clone(), &tx.to, clause.vars.clone());
             for expr_str in clause.expr.exprs() {
                 match expr::evaluate_explain(expr_str, &ctx, Arc::clone(cx.builtins)).await {
                     Ok((true, _)) => {}
@@ -686,7 +724,11 @@ impl Checker {
         }
         let inner_target = inner.target;
         let inner_address = format!("{inner_target} (inner[{idx}])");
-        let Some(rules) = cx.resolver.contract_rules(tx.chain_id, inner_target).await else {
+        let Some(rules) = cx
+            .resolver
+            .contract_rules(ChainRef::Evm(tx.chain_id), inner_target)
+            .await
+        else {
             return Err(DenyReason::NoContract {
                 address: inner_address,
                 chain_id: tx.chain_id,
@@ -728,16 +770,7 @@ impl Checker {
         let mut last_denied = String::new();
         let mut last_failing = None;
         'clauses: for clause in &inner_entry.clauses {
-            let inner_ctx = EvalContext {
-                chain_id: tx.chain_id,
-                value: tx.value,
-                args: inner_args.clone(),
-                from_address: tx.from.to_lowercase(),
-                to_address: inner_target.to_lowercase(),
-                gas_price: tx.gas_price,
-                gas_limit: tx.gas_limit,
-                vars: clause.vars.clone(),
-            };
+            let inner_ctx = evm_eval_ctx(tx, inner_args.clone(), inner_target, clause.vars.clone());
             for expr_str in clause.expr.exprs() {
                 match expr::evaluate_explain(expr_str, &inner_ctx, Arc::clone(cx.builtins)).await {
                     Ok((true, _)) => {}
@@ -772,6 +805,10 @@ impl Checker {
         req: &TypedDataRequest,
         resolver: &dyn RuleResolver,
     ) -> CheckResult {
+        // EIP-712 is EVM-only; adapt the caller's resolver for the internal
+        // ChainResolver plumbing (same pattern as `check`).
+        let resolver = &CompatResolver(resolver);
+
         // 1. No verifyingContract (or zero address) → off-chain auth, skip WAF
         let contract = match req.domain.verifying_contract.as_deref() {
             Some(c) if !is_missing_or_zero_address(c) => c.to_lowercase(),
@@ -786,13 +823,13 @@ impl Checker {
         // 3. Rule lookup: "domain.name::primaryType" acts as the selector
         let domain_name = normalize_domain_name(&req.domain.name);
         let selector = format!("{}::{}", domain_name, req.primary_type);
-        let builtins = self.builtins_for(resolver, req.domain.chain_id);
+        let builtins = self.builtins_for(resolver, ChainRef::Evm(req.domain.chain_id));
         let ctx = CheckCtx {
             resolver,
             builtins: &builtins,
         };
         let entry = match resolver
-            .contract_rules(req.domain.chain_id, &contract)
+            .contract_rules(ChainRef::Evm(req.domain.chain_id), &contract)
             .await
             .map(|rules| lookup_rules(&rules, &selector))
         {
@@ -855,6 +892,8 @@ impl Checker {
                 gas_price: 0,
                 gas_limit: 0,
                 vars: clause.vars.clone(),
+                network: format!("eip155:{}", req.domain.chain_id),
+                chain_fields: HashMap::new(),
             };
             for expr_str in clause.expr.exprs() {
                 match expr::evaluate_explain(expr_str, &ctx, Arc::clone(cx.builtins)).await {
@@ -915,6 +954,18 @@ impl Checker {
     /// When `abi` is omitted the engine falls back to the stored rule's ABI
     /// (via `resolver`) for calldata decoding.
     pub async fn test(&self, tx: &Transaction, resolver: Option<&dyn RuleResolver>) -> CheckResult {
+        let compat = resolver.map(CompatResolver);
+        self.test_tx(
+            &ChainTx::Evm(tx.clone()),
+            compat.as_ref().map(|c| c as &dyn ChainResolver),
+        )
+        .await
+    }
+
+    /// Unified test-mode preview (mirrors [`Checker::test`]): inline `abi` on
+    /// the transaction plays the role of `Transaction.abi` today.
+    pub async fn test_tx(&self, tx: &ChainTx, resolver: Option<&dyn ChainResolver>) -> CheckResult {
+        let ChainTx::Evm(tx) = tx;
         if let Some(r) = self.step_transaction_type(tx) {
             return r;
         }
@@ -922,7 +973,7 @@ impl Checker {
             Some(e) => e.clone(),
             None => return CheckResult::Denied(DenyReason::NoExprInTest),
         };
-        let builtins = self.builtins_for_opt(resolver, tx.chain_id);
+        let builtins = self.builtins_for_opt(resolver, ChainRef::Evm(tx.chain_id));
 
         let selector = if tx.data.len() >= 10 {
             tx.data[..10].to_lowercase()
@@ -938,7 +989,7 @@ impl Checker {
         } else {
             let found = match resolver {
                 Some(r) => r
-                    .contract_rules(tx.chain_id, &tx.to)
+                    .contract_rules(ChainRef::Evm(tx.chain_id), &tx.to)
                     .await
                     .map(|rules| lookup_rules(&rules, &selector)),
                 None => None,
@@ -973,16 +1024,7 @@ impl Checker {
             Default::default()
         };
 
-        let ctx = EvalContext {
-            chain_id: tx.chain_id,
-            value: tx.value,
-            args,
-            from_address: tx.from.to_lowercase(),
-            to_address: tx.to.to_lowercase(),
-            gas_price: tx.gas_price,
-            gas_limit: tx.gas_limit,
-            vars,
-        };
+        let ctx = evm_eval_ctx(tx, args, &tx.to, vars);
 
         // Evaluate the outer expression first
         let (outer_ok, explain) =
@@ -1033,6 +1075,8 @@ impl Checker {
                         gas_price: ctx.gas_price,
                         gas_limit: ctx.gas_limit,
                         vars: ctx.vars.clone(),
+                        network: ctx.network.clone(),
+                        chain_fields: HashMap::new(),
                     };
 
                     match expr::evaluate_explain(&expr_str, &inner_ctx, Arc::clone(&builtins)).await
