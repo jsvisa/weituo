@@ -40,9 +40,13 @@ Everything is **additive**. Existing types are wrapped, never mutated:
 // 2.1 ChainRef — EVM keeps numeric ids, so today's keys still work
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChainRef {
-    Evm(u64),          // 1, 137, 8453, …          From<u64> provided
+    Evm(u64),          // 1, 137, 8453, …
     Svm(String),       // "mainnet-beta"
     Sui(String),       // "mainnet"
+}
+
+impl From<u64> for ChainRef {
+    fn from(n: u64) -> Self { Self::Evm(n) }
 }
 
 impl ChainRef {
@@ -193,7 +197,7 @@ Every family normalizes to the same internal unit before rule matching:
 ```rust
 struct Call<'a> {
     target: &'a str,      // EVM contract / SVM program id / Sui package address
-    selector: String,     // 4-byte hex / 8-byte discriminator hex / "module::function"
+    selector: String,     // 4-byte hex / discriminator or tag-prefix hex / "module::function"
     args: HashMap<String, serde_json::Value>,  // decoded call arguments
     meta: CallMeta,       // family-specific context → EvalContext.chain_fields
 }
@@ -302,8 +306,9 @@ live in the *accounts*, not in borsh args.
 - func: "swap"
   expr: "args.amount <= vars.max_notional"
 
-# Non-Anchor program (SPL Token TransferChecked, data tag 0x0c): a hex
-# `func` prefix matches the instruction-data prefix. TransferChecked
+# Non-Anchor program (SPL Token TransferChecked): the `func` hex is a
+# prefix of the instruction data, and the decoder strips exactly those
+# bytes before decoding args (SPL token tags are u8). TransferChecked
 # accounts = [source, mint, destination, owner]:
 - func: "0x0c"
   abi: { args: [{name: "amount", type: "u64"}, {name: "decimals", type: "u8"}] }
@@ -311,8 +316,10 @@ live in the *accounts*, not in borsh args.
          and accounts[2] in vars.my_wallets
          and args.amount <= vars.max_usdc"
 
-# Native SOL transfer (System::Transfer, tag 0x02): recipient is accounts[1]
-- func: "0x02"
+# Native SOL transfer (System::Transfer): the System program tags are
+# u32 LE, so the func prefix is 4 bytes — the decoder strips exactly those
+# bytes before decoding args. Recipient is accounts[1].
+- func: "0x02000000"
   abi: { args: [{name: "lamports", type: "u64"}] }
   expr: "accounts[1] in vars.my_wallets and args.lamports <= vars.max_sol"
 ```
@@ -406,7 +413,7 @@ short Sui address literals.
 
 ## 7. Builtin sets
 
-`KnownBuiltins` becomes per-family (registered registry), while generic names
+`KnownBuiltins` becomes a per-family registry, while generic names
 stay stable across families so simple rules port unchanged:
 
 | builtin | evm (today) | svm | sui |
@@ -416,7 +423,7 @@ stay stable across families so simple rules port unchanged:
 | `$is_contract(a)` / `$is_eoa(a)` | eth_getCode | account exists & executable | object is a move package |
 | `$block()` / `$gas_price` | ✓ | — (fail at load) | — (fail at load) |
 | `$erc20_*` | ✓ | — (fail at load) | — |
-| `$spl_balance_of(token_mint, owner)` | — | getTokenAccountsByOwner (jsonParsed) | — |
+| `$spl_balance_of(token_mint, owner)` | — | getTokenAccountsByOwner (jsonParsed), summed across the owner's accounts for that mint | — |
 | `$spl_allowance(mint, owner, delegate)` | — | token-account `delegate`/`delegated_amount`; an owner may hold several accounts per mint, so v1 scans all of the owner's accounts for that mint and takes the max match | — |
 | `$coin_balance(owner, coin_type)` | — | — | sui_getBalance(coinType) |
 | `$b32int2addr` | ✓ | — | — |
@@ -447,9 +454,11 @@ rule's IDL fragment), so both are **hand-rolled byte-slice decoders** — no
 ### 8.1 SVM: Anchor IDL + borsh
 
 - Rule ABI fragment: `{ name, args: [{name, type}] }` with Anchor types:
-  primitives (`u8…u64`, `i8…i64`, `bool`, `pubkey`), `{option: T}`,
-  `{vec: T}`, `{array: [T, N]}`, `{defined: {name}}` resolved via an optional
-  `types:` map on the same fragment (same spirit as EVM tuple `components`).
+  primitives (`u8`/`u16`/`u32`/`u64`/`u128`/`u256` and signed, `bool`,
+  `pubkey`), `{option: T}`, `{vec: T}`, `{array: [T, N]}`, `{defined: {name}}`
+  resolved via an optional `types:` map on the same fragment (same spirit as
+  EVM tuple `components`). Both legacy and current Anchor IDL type
+  renderings are accepted.
 - Unknown/unresolvable type at load → rule loads with args unavailable and
   **the rule is treated as fail-closed**: expressions referencing `args.*`
   error at check time (deny), never silently pass.
@@ -458,6 +467,11 @@ rule's IDL fragment), so both are **hand-rolled byte-slice decoders** — no
 - Discriminator: `sha256("global:" + snake_case(name))[..8]` computed at
   rule load (new dep `sha2`). When a rule's `func` is already hex, it is used
   verbatim (covers non-Anchor programs and hand-written rules).
+- The decoder strips **exactly the `func` hex bytes** before decoding args:
+  Anchor = 8 bytes; non-Anchor programs use their native tag width (SPL
+  token: u8 → `"0x0c"`; System: u32 LE → `"0x02000000"`). Rule authors must
+  supply the program's full tag — a shorter prefix strips too few bytes and
+  misaligns the decode.
 - Synthetic context (NOT an arg): every SVM call exposes the instruction's
   resolved account keys as the context identifier `accounts`
   (`Vec<base58>`, indexable, `.length` works). Because it lives outside the
@@ -466,9 +480,10 @@ rule's IDL fragment), so both are **hand-rolled byte-slice decoders** — no
 
 ### 8.2 Sui: Move signatures + BCS
 
-- Rule ABI fragment: `{ parameters: [type-string] }` using normalized Move
+- Rule ABI fragment: `{ params: [{name, type}] }` (§5) using normalized Move
   type syntax (`u64`, `address`, `bool`, `vector<T>`, `0x2::coin::Coin<T>`,
-  `Option<T>`, `string`).
+  `Option<T>`, `string`). Bare type strings are accepted for quick rules and
+  map to `__arg{i}` keys.
 - Decoding `MoveCall` arguments positionally against the function signature,
   **after filtering out reference parameters**: `&T` / `&mut T` params —
   always including the trailing `&mut 0x2::tx_context::TxContext` — are
@@ -551,6 +566,9 @@ families unchanged.
 
 ## 11. Phases
 
+Workflow is test-first (TDD): every phase lands as failing golden-vector /
+characterization tests before the implementation that turns them green.
+
 1. **Foundations** — `ChainRef`, `ChainTx`, `ChainResolver` + `CompatResolver`,
    normalized `Call` model refactor behind `check`/`check_tx`, `EvalContext`
    fields, per-family analyze profiles (EVM = today), YAML `chain:` key.
@@ -564,9 +582,9 @@ families unchanged.
 4. **Polish** — README + `embed_checker` multi-chain example, `0.3.0` bump,
    CI matrix (EVM-only build with `--no-default-features`).
 
-New dependencies: `sha2`, `base58` (both tiny, pure Rust). SVM/Sui sit behind
-non-removable-by-default features `svm` / `sui`; EVM-only embedders build
-with `default-features = false`.
+New dependencies: `sha2`, `base58` (both tiny, pure Rust). The `svm` / `sui`
+features are enabled by default; EVM-only embedders build with
+`default-features = false`.
 
 ## 12. Deferred (explicitly out of scope for `0.3.0`)
 
