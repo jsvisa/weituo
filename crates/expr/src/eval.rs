@@ -706,12 +706,24 @@ pub fn resolve_attribute(parts: &[AttrSegment], ctx: &EvalContext) -> Value {
         return match parts[0].as_field() {
             Some("from_address") => Value::Str(ctx.from_address.clone()),
             Some("to_address") => Value::Str(ctx.to_address.clone()),
-            Some("chainId") => Value::Int(ctx.chain_id as i64),
+            Some("chainId") => chain_id_value(ctx),
+            Some("network") => Value::Str(ctx.network.clone()),
             Some("value") => Value::BigUint(ctx.value),
             Some("gasPrice") => Value::Int(ctx.gas_price as i64),
             Some("gasLimit") => Value::Int(ctx.gas_limit as i64),
-            _ => Value::Null,
+            other => match other.and_then(|name| ctx.chain_fields.get(name)) {
+                Some(v) => Value::from(v.clone()),
+                None => Value::Null,
+            },
         };
+    }
+
+    // Family-specific context data (accounts, type_arguments, …) — full
+    // attribute paths: `accounts[1]`, `accounts.length`, …
+    if let Some(root) = parts[0].as_field() {
+        if let Some(v) = ctx.chain_fields.get(root) {
+            return traverse_json(v.clone(), &parts[1..]);
+        }
     }
 
     // vars.<name>  — scalar lookup only; deeper paths (vars.FOO.bar) → Null
@@ -742,6 +754,19 @@ pub fn resolve_attribute(parts: &[AttrSegment], ctx: &EvalContext) -> Value {
     }
 
     Value::Null
+}
+
+/// `chainId` resolution per family: EVM (numeric or legacy empty network) →
+/// numeric EIP-155 id; `svm:`/`sui:` networks → the network name without the
+/// family prefix (`"svm:mainnet-beta"` → `"mainnet-beta"`).
+fn chain_id_value(ctx: &EvalContext) -> Value {
+    if ctx.network.is_empty() || ctx.network.starts_with("eip155:") {
+        return Value::Int(ctx.chain_id as i64);
+    }
+    match ctx.network.find(':') {
+        Some(idx) => Value::Str(ctx.network[idx + 1..].to_string()),
+        None => Value::Str(ctx.network.clone()),
+    }
 }
 
 /// Traverse a serde_json::Value using remaining AttrSegments.

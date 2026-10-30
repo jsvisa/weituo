@@ -94,3 +94,33 @@ pub fn validate_full(
         .map(|e| e.message)
         .collect()
 }
+
+/// Family-aware `validate_full`: same checks but with the per-family
+/// context-field profile and address-literal rules (`Family::Svm` accepts
+/// `accounts[1]` and base58 literals; `Family::Sui` accepts `type_arguments`
+/// and 64-nibble hex literals).
+pub fn validate_full_for(
+    expr: &str,
+    family: analyze::Family,
+    param_names: &[&str],
+    known_builtins: &[&str],
+    param_types: &HashMap<String, String>,
+    var_values: &HashMap<String, serde_json::Value>,
+) -> Vec<String> {
+    let cleaned = strip_comments(expr);
+    let ast = match parse(&cleaned) {
+        Ok(a) => a,
+        Err(e) => return vec![format!("syntax error: {e}")],
+    };
+    analyze::validate_semantics_for(
+        &ast,
+        family,
+        param_names,
+        known_builtins,
+        param_types,
+        var_values,
+    )
+    .into_iter()
+    .map(|e| e.message)
+    .collect()
+}
