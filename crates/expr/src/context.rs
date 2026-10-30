@@ -17,6 +17,13 @@ pub struct EvalContext {
     pub gas_limit: u64,
     /// Rule-level named constants: var_name → json value
     pub vars: HashMap<String, JsonValue>,
+    /// Family-prefixed chain reference: `"eip155:1"` / `"svm:mainnet-beta"` /
+    /// `"sui:mainnet"`. Empty = legacy EVM-only context (chainId stays numeric).
+    pub network: String,
+    /// Family-specific context data (SVM `accounts`, Sui `type_arguments`,
+    /// per-call indexes, …). Resolvable as bare identifiers and attribute
+    /// paths (`accounts[1]`, `accounts.length`).
+    pub chain_fields: HashMap<String, JsonValue>,
 }
 
 impl Default for EvalContext {
@@ -30,6 +37,8 @@ impl Default for EvalContext {
             gas_price: 0,
             gas_limit: 0,
             vars: HashMap::new(),
+            network: String::new(),
+            chain_fields: HashMap::new(),
         }
     }
 }
@@ -45,6 +54,8 @@ impl EvalContext {
             gas_price: 0,
             gas_limit: 0,
             vars: HashMap::new(),
+            network: String::new(),
+            chain_fields: HashMap::new(),
         }
     }
 }

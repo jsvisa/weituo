@@ -21,6 +21,52 @@ pub const KNOWN_CONTEXT_FIELDS: &[(&str, &str)] = &[
     ("gasLimit", "num"),
 ];
 
+/// Chain family — selects the context-field profile and address validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Family {
+    #[default]
+    Evm,
+    Svm,
+    Sui,
+}
+
+/// Per-family context-field profiles. `kind`: "str" | "num" | "list".
+/// List-valued fields (`accounts`, `type_arguments`, `signers`) are indexed
+/// in expressions (`accounts[1]`, `accounts.length`).
+pub const SVM_CONTEXT_FIELDS: &[(&str, &str)] = &[
+    ("from_address", "str"),
+    ("to_address", "str"),
+    ("chainId", "str"),
+    ("network", "str"),
+    ("instruction_index", "num"),
+    ("num_instructions", "num"),
+    ("signers", "list"),
+    ("accounts", "list"),
+];
+
+pub const SUI_CONTEXT_FIELDS: &[(&str, &str)] = &[
+    ("from_address", "str"),
+    ("to_address", "str"),
+    ("chainId", "str"),
+    ("network", "str"),
+    ("command_index", "num"),
+    ("num_commands", "num"),
+    ("command_kind", "str"),
+    ("gas_budget", "num"),
+    ("gas_price", "num"),
+    ("type_arguments", "list"),
+];
+
+/// Context fields known to a family. `chain_fields` extras declared by the
+/// embedding layer are appended by the caller, not here.
+pub const fn known_context_fields(family: Family) -> &'static [(&'static str, &'static str)] {
+    match family {
+        Family::Evm => KNOWN_CONTEXT_FIELDS,
+        Family::Svm => SVM_CONTEXT_FIELDS,
+        Family::Sui => SUI_CONTEXT_FIELDS,
+    }
+}
+
 /// Decimal block fields from `eth_getBlockByNumber` that are safe to access via `$block().field`.
 /// Also the whitelist for the `$block()` builtin's output — the builtin keeps only these fields.
 pub const BLOCK_FIELDS: &[&str] = &[
@@ -82,9 +128,30 @@ pub fn validate_semantics(
     param_types: &HashMap<String, String>,
     var_values: &HashMap<String, serde_json::Value>,
 ) -> Vec<SemanticError> {
+    validate_semantics_for(
+        ast,
+        Family::Evm,
+        param_names,
+        known_builtins,
+        param_types,
+        var_values,
+    )
+}
+
+/// Family-aware semantic validation. `family` selects the context-field
+/// profile and the address-literal validation rules.
+pub fn validate_semantics_for(
+    ast: &Expr,
+    family: Family,
+    param_names: &[&str],
+    known_builtins: &[&str],
+    param_types: &HashMap<String, String>,
+    var_values: &HashMap<String, serde_json::Value>,
+) -> Vec<SemanticError> {
     let mut errors = Vec::new();
     walk(
         ast,
+        family,
         param_names,
         known_builtins,
         param_types,
@@ -96,6 +163,7 @@ pub fn validate_semantics(
 
 fn walk(
     expr: &Expr,
+    family: Family,
     params: &[&str],
     builtins: &[&str],
     param_types: &HashMap<String, String>,
@@ -104,27 +172,67 @@ fn walk(
 ) {
     match expr {
         Expr::And(l, r) | Expr::Or(l, r) => {
-            walk(l, params, builtins, param_types, var_values, errors);
-            walk(r, params, builtins, param_types, var_values, errors);
+            walk(l, family, params, builtins, param_types, var_values, errors);
+            walk(r, family, params, builtins, param_types, var_values, errors);
         }
         Expr::Arith { lhs: l, rhs: r, .. } => {
-            walk(l, params, builtins, param_types, var_values, errors);
-            walk(r, params, builtins, param_types, var_values, errors);
+            walk(l, family, params, builtins, param_types, var_values, errors);
+            walk(r, family, params, builtins, param_types, var_values, errors);
         }
         Expr::BinOp { op, lhs, rhs } => {
-            walk(lhs, params, builtins, param_types, var_values, errors);
-            walk(rhs, params, builtins, param_types, var_values, errors);
-            check_type_compat(op, lhs, rhs, param_types, var_values, errors);
+            walk(
+                lhs,
+                family,
+                params,
+                builtins,
+                param_types,
+                var_values,
+                errors,
+            );
+            walk(
+                rhs,
+                family,
+                params,
+                builtins,
+                param_types,
+                var_values,
+                errors,
+            );
+            check_type_compat(op, lhs, rhs, family, param_types, var_values, errors);
         }
         Expr::Not(inner) | Expr::Neg(inner) => {
-            walk(inner, params, builtins, param_types, var_values, errors);
+            walk(
+                inner,
+                family,
+                params,
+                builtins,
+                param_types,
+                var_values,
+                errors,
+            );
         }
         Expr::In { val, list, .. } => {
-            walk(val, params, builtins, param_types, var_values, errors);
+            walk(
+                val,
+                family,
+                params,
+                builtins,
+                param_types,
+                var_values,
+                errors,
+            );
             for item in list {
-                walk(item, params, builtins, param_types, var_values, errors);
+                walk(
+                    item,
+                    family,
+                    params,
+                    builtins,
+                    param_types,
+                    var_values,
+                    errors,
+                );
             }
-            check_in_type_compat(val, list, param_types, var_values, errors);
+            check_in_type_compat(val, list, family, param_types, var_values, errors);
         }
         Expr::Builtin { name, args, path } => {
             if !builtins.contains(&name.as_str()) {
@@ -149,7 +257,7 @@ fn walk(
                 }
             }
             for a in args {
-                walk(a, params, builtins, param_types, var_values, errors);
+                walk(a, family, params, builtins, param_types, var_values, errors);
             }
         }
         Expr::FuncCall { name, args } => {
@@ -175,19 +283,19 @@ fn walk(
                 }
             }
             for a in args {
-                walk(a, params, builtins, param_types, var_values, errors);
+                walk(a, family, params, builtins, param_types, var_values, errors);
             }
         }
         Expr::Attribute(parts) => {
             let root = parts[0].as_field();
+            let fields = known_context_fields(family);
 
             // Bare identifier — must be a known transaction context field
             if parts.len() == 1 {
                 if let Some(name) = root {
-                    let known = KNOWN_CONTEXT_FIELDS.iter().any(|(f, _)| *f == name);
+                    let known = fields.iter().any(|(f, _)| *f == name);
                     if !known {
-                        let available: Vec<&str> =
-                            KNOWN_CONTEXT_FIELDS.iter().map(|(f, _)| *f).collect();
+                        let available: Vec<&str> = fields.iter().map(|(f, _)| *f).collect();
                         errors.push(SemanticError {
                             message: format!(
                                 "unknown identifier '{}' — context fields: {}",
@@ -202,18 +310,14 @@ fn walk(
 
             // Multi-segment path: root must be args, vars, or a known context field root
             let known_root = matches!(root, Some("args") | Some("vars"))
-                || root.is_some_and(|r| KNOWN_CONTEXT_FIELDS.iter().any(|(f, _)| *f == r));
+                || root.is_some_and(|r| fields.iter().any(|(f, _)| *f == r));
             if !known_root {
                 if let Some(name) = root {
                     errors.push(SemanticError {
                         message: format!(
                             "unknown identifier '{}' — context fields: {}; use args.* for calldata, vars.* for user-defined variables",
                             name,
-                            KNOWN_CONTEXT_FIELDS
-                                .iter()
-                                .map(|(f, _)| *f)
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            fields.iter().map(|(f, _)| *f).collect::<Vec<_>>().join(", ")
                         ),
                     });
                 }
@@ -271,6 +375,7 @@ fn check_type_compat(
     _op: &BinOp,
     lhs: &Expr,
     rhs: &Expr,
+    family: Family,
     param_types: &HashMap<String, String>,
     var_values: &HashMap<String, serde_json::Value>,
     errors: &mut Vec<SemanticError>,
@@ -309,7 +414,7 @@ fn check_type_compat(
         if let Some((solidity_type, arg_path)) = solidity_type_for_args_attr(args_expr, param_types)
         {
             let expected = solidity_kind(solidity_type);
-            if let Some(actual) = expr_kind(other_expr, var_values) {
+            if let Some(actual) = expr_kind(other_expr, family, var_values) {
                 if expected != actual && expected != "unknown" {
                     let detail = format_other(other_expr, actual);
                     errors.push(SemanticError {
@@ -318,8 +423,8 @@ fn check_type_compat(
                             arg_path, solidity_type, expected, detail
                         ),
                     });
-                } else if solidity_type == "address" {
-                    if let Some(message) = invalid_address_message(other_expr, var_values) {
+                } else if is_address_like(solidity_type) {
+                    if let Some(message) = invalid_address_message(other_expr, var_values, family) {
                         errors.push(SemanticError {
                             message: format!("invalid address for '{}': {message}", arg_path),
                         });
@@ -331,16 +436,21 @@ fn check_type_compat(
     }
 
     // ── context field type check (always active) ──────────────────────────────
-    let (ctx_expr, other_expr) = if is_context_field(lhs) {
+    let (ctx_expr, other_expr) = if is_context_field(lhs, family) {
         (lhs, rhs)
-    } else if is_context_field(rhs) {
+    } else if is_context_field(rhs, family) {
         (rhs, lhs)
     } else {
         return;
     };
 
-    if let Some(expected) = context_field_kind(ctx_expr) {
-        if let Some(actual) = expr_kind(other_expr, var_values) {
+    if let Some(expected) = context_field_kind(ctx_expr, family) {
+        // List-valued fields (accounts, type_arguments, …) are compared
+        // element-wise in practice; skip whole-value kind checks for them.
+        if expected == "list" {
+            return;
+        }
+        if let Some(actual) = expr_kind(other_expr, family, var_values) {
             if expected != actual {
                 let name = context_field_name(ctx_expr).unwrap_or("?");
                 let detail = format_other(other_expr, actual);
@@ -359,13 +469,14 @@ fn check_type_compat(
 fn check_in_type_compat(
     val: &Expr,
     list: &[Expr],
+    family: Family,
     param_types: &HashMap<String, String>,
     var_values: &HashMap<String, serde_json::Value>,
     errors: &mut Vec<SemanticError>,
 ) {
     // Determine the expected kind of the LHS (`val`)
-    let expected: &'static str = if is_context_field(val) {
-        match context_field_kind(val) {
+    let expected: &'static str = if is_context_field(val, family) {
+        match context_field_kind(val, family) {
             Some(k) => k,
             None => return,
         }
@@ -379,15 +490,15 @@ fn check_in_type_compat(
         return; // can't determine val's type — skip
     };
 
-    if expected == "unknown" {
+    if expected == "unknown" || expected == "list" {
         return;
     }
 
     for item in list {
-        if let Some(actual) = expr_kind(item, var_values) {
+        if let Some(actual) = expr_kind(item, family, var_values) {
             if actual != expected {
                 let detail = format_other(item, actual);
-                let val_name = if is_context_field(val) {
+                let val_name = if is_context_field(val, family) {
                     context_field_name(val).unwrap_or("val").to_string()
                 } else {
                     solidity_type_for_args_attr(val, param_types)
@@ -403,7 +514,7 @@ fn check_in_type_compat(
             }
         }
         if let Some(("address", path)) = solidity_type_for_args_attr(val, param_types) {
-            if let Some(message) = invalid_address_message(item, var_values) {
+            if let Some(message) = invalid_address_message(item, var_values, family) {
                 errors.push(SemanticError {
                     message: format!("invalid address for '{path}': {message}"),
                 });
@@ -512,12 +623,11 @@ fn array_element_type(solidity_type: &str) -> Option<&str> {
         .then_some(&solidity_type[..open])
 }
 
-fn is_context_field(expr: &Expr) -> bool {
+fn is_context_field(expr: &Expr, family: Family) -> bool {
+    let fields = known_context_fields(family);
     matches!(expr, Expr::Attribute(parts)
         if parts.len() == 1
-        && parts[0].as_field().is_some_and(|n| {
-            KNOWN_CONTEXT_FIELDS.iter().any(|(f, _)| *f == n)
-        })
+        && parts[0].as_field().is_some_and(|n| fields.iter().any(|(f, _)| *f == n))
     )
 }
 
@@ -530,9 +640,9 @@ fn context_field_name(expr: &Expr) -> Option<&str> {
     None
 }
 
-fn context_field_kind(expr: &Expr) -> Option<&'static str> {
+fn context_field_kind(expr: &Expr, family: Family) -> Option<&'static str> {
     let name = context_field_name(expr)?;
-    KNOWN_CONTEXT_FIELDS
+    known_context_fields(family)
         .iter()
         .find(|(f, _)| *f == name)
         .map(|(_, k)| *k)
@@ -548,28 +658,62 @@ fn format_other(expr: &Expr, actual: &str) -> String {
     }
 }
 
-/// Maps a Solidity ABI type string to the runtime value kind.
+/// Types whose decoded values are address-like strings: EVM `address`,
+/// Move `address`/`Address` (normalized renderings), Anchor `pubkey`.
+fn is_address_like(ty: &str) -> bool {
+    matches!(ty, "address" | "Address" | "pubkey")
+}
+
+/// Maps a Solidity ABI type string to the runtime value kind. Extended with
+/// Anchor (SVM) and normalized-Move (Sui) type names so per-family
+/// `param_types` maps type-check the same way.
 fn solidity_kind(ty: &str) -> &'static str {
-    if ty == "address" || ty == "string" || ty.starts_with("bytes") {
+    if ty == "address" || ty == "Address" || ty == "pubkey" || ty == "string" {
         "str"
-    } else if ty.starts_with("uint") || ty.starts_with("int") {
-        "num"
-    } else if ty == "bool" {
+    } else if ty == "bool" || ty == "Bool" {
         "bool"
+    } else if is_uint_or_int_type(ty) {
+        "num"
+    } else if ty.starts_with("bytes") {
+        // EVM bytes/bytesN and similar opaque binaries
+        "str"
+    } else if ty.contains("::") {
+        // Move struct type (e.g. "0x2::coin::Coin<0x2::sui::SUI>") — opaque string value
+        "str"
     } else {
         "unknown"
     }
 }
 
+/// `uint*`/`int*` (EVM ABI), `u8`…`u256`/`i8`…`i256` (Anchor IDL),
+/// `U8`…/`I8`… (normalized Move, matched case-insensitively).
+fn is_uint_or_int_type(ty: &str) -> bool {
+    let lower = ty.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("uint") {
+        return rest.is_empty() || rest.bytes().all(|b| b.is_ascii_digit());
+    }
+    if let Some(rest) = lower.strip_prefix("int") {
+        return rest.is_empty() || rest.bytes().all(|b| b.is_ascii_digit());
+    }
+    match lower.strip_prefix('u').or_else(|| lower.strip_prefix('i')) {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
 /// Returns the kind of the expression if it can be determined statically.
 /// Returns None for dynamic expressions (args.X, builtins, function calls).
-fn expr_kind(expr: &Expr, var_values: &HashMap<String, serde_json::Value>) -> Option<&'static str> {
+fn expr_kind(
+    expr: &Expr,
+    family: Family,
+    var_values: &HashMap<String, serde_json::Value>,
+) -> Option<&'static str> {
     match expr {
         Expr::Lit(lit) => Some(literal_kind(lit)),
         Expr::Attribute(parts) => {
             if parts.len() == 1 {
                 // Bare context field (from_address, value, …)
-                context_field_kind(expr)
+                context_field_kind(expr, family)
             } else if parts[0].as_field() == Some("vars") && parts.len() == 2 {
                 let name = parts[1].as_field()?;
                 var_values.get(name).map(json_kind)
@@ -594,6 +738,7 @@ const fn literal_kind(lit: &crate::ast::Literal) -> &'static str {
 fn invalid_address_message(
     expr: &Expr,
     var_values: &HashMap<String, serde_json::Value>,
+    family: Family,
 ) -> Option<String> {
     let value = match expr {
         Expr::Lit(crate::ast::Literal::Str(value)) => value.as_str(),
@@ -603,14 +748,54 @@ fn invalid_address_message(
         _ => return None,
     };
 
-    if value.len() != 42 {
-        return Some(format!("expected 42 characters, got {}", value.len()));
+    validate_address_value(value, family)
+}
+
+/// Family-aware address-literal validation. Returns the error message when
+/// the literal is not a valid address for the family.
+fn validate_address_value(value: &str, family: Family) -> Option<String> {
+    match family {
+        Family::Evm => {
+            if value.len() != 42 {
+                return Some(format!("expected 42 characters, got {}", value.len()));
+            }
+            let normalized = value.to_lowercase();
+            normalized
+                .parse::<Address>()
+                .err()
+                .map(|_| "address is invalid".to_string())
+        }
+        Family::Svm => {
+            // base58: 32-byte pubkeys encode to 32–44 chars from the
+            // base58 alphabet (0, O, I, l are excluded).
+            const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+            if !(32..=44).contains(&value.len()) {
+                return Some(format!(
+                    "expected 32–44 base58 characters, got {}",
+                    value.len()
+                ));
+            }
+            if !value.bytes().all(|b| BASE58.contains(&b)) {
+                return Some("address contains invalid base58 characters".to_string());
+            }
+            None
+        }
+        Family::Sui => {
+            // Full 64-nibble lowercase hex, optional 0x prefix. Short forms
+            // are rejected at load so literals match normalized rule keys.
+            let hex = value.strip_prefix("0x").unwrap_or(value);
+            if hex.len() != 64 {
+                return Some(format!(
+                    "expected the full 64-nibble lowercase hex form, got {} characters",
+                    hex.len()
+                ));
+            }
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Some("address contains invalid hex characters".to_string());
+            }
+            None
+        }
     }
-    let normalized = value.to_lowercase();
-    normalized
-        .parse::<Address>()
-        .err()
-        .map(|_| "address is invalid".to_string())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
