@@ -310,6 +310,40 @@ impl Evaluator {
                 Ok(Value::Bool(if *negated { !found } else { found }))
             }
 
+            Expr::InSource {
+                val,
+                source,
+                negated,
+            } => {
+                let v = self.eval_inner(val, ctx).await?;
+                let src = self.eval_inner(source, ctx).await?;
+                let items = match src {
+                    Value::Json(boxed) => match *boxed {
+                        serde_json::Value::Array(items) => items,
+                        other => {
+                            return Err(anyhow!(
+                                "'in' requires a list on the right-hand side, got JSON {}",
+                                if other.is_object() {
+                                    "object"
+                                } else {
+                                    "scalar"
+                                }
+                            ))
+                        }
+                    },
+                    other => {
+                        return Err(anyhow!(
+                            "'in' requires a list on the right-hand side, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                let found = items
+                    .iter()
+                    .any(|item| values_eq(&v, &Value::from(item.clone())));
+                Ok(Value::Bool(if *negated { !found } else { found }))
+            }
+
             Expr::Arith { op, lhs, rhs } => {
                 let l = self.eval_inner(lhs, ctx).await?;
                 let r = self.eval_inner(rhs, ctx).await?;

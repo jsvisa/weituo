@@ -38,6 +38,7 @@ fn rules() -> HashMap<(u64, String), HashMap<String, RuleEntry>> {
             }))
             .unwrap(),
         ),
+        family_abi: None,
         multicall: None,
         invalid_decoder: false,
     };

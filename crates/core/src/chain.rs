@@ -52,7 +52,9 @@ impl ChainRef {
 #[derive(Debug, Clone)]
 pub enum ChainTx {
     Evm(Transaction),
-    // Svm(SvmTx)   — phase 2 (feature `svm`)
+    /// SVM transaction (feature `svm`) — resolved accounts, base58/hex data.
+    #[cfg(feature = "svm")]
+    Svm(crate::svm::SvmTx),
     // Sui(SuiTx)   — phase 3 (feature `sui`)
 }
 
@@ -63,8 +65,8 @@ impl ChainTx {
     /// - absent (or `"evm"`) → legacy strict EVM parse — today's payloads are
     ///   byte-identical, and a foreign-shaped payload without `chain` fails
     ///   the EVM parser's missing-field checks (fail-closed);
-    /// - `"svm"` / `"sui"` → not supported yet (their phases land with the
-    ///   `svm` / `sui` features).
+    /// - `"svm"` / `"sui"` → parsed by their family (feature-gated; a build
+    ///   without the feature rejects the payload instead of guessing).
     pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
         match v.get("chain").and_then(|c| c.as_str()) {
             None | Some("evm") => {
@@ -72,10 +74,17 @@ impl ChainTx {
                     .map_err(|e| format!("invalid EVM transaction payload: {e}"))?;
                 Ok(Self::Evm(tx))
             }
-            Some("svm") => Err(
-                "chain family 'svm' is not supported by this build (missing `svm` feature)"
-                    .to_string(),
-            ),
+            Some("svm") => {
+                #[cfg(feature = "svm")]
+                {
+                    Ok(Self::Svm(crate::svm::SvmTx::from_json(v)?))
+                }
+                #[cfg(not(feature = "svm"))]
+                Err(
+                    "chain family 'svm' is not supported by this build (missing `svm` feature)"
+                        .to_string(),
+                )
+            }
             Some("sui") => Err(
                 "chain family 'sui' is not supported by this build (missing `sui` feature)"
                     .to_string(),

@@ -67,6 +67,51 @@ pub const fn known_context_fields(family: Family) -> &'static [(&'static str, &'
     }
 }
 
+/// Builtin set per family (design §7): generic names stay stable so simple
+/// rules port unchanged; EVM-only chain-data builtins are absent from the
+/// SVM/Sui sets (a rule referencing them fails at load). Embedding-provided
+/// builtins (`$price_of`, `$is_scam`, …) are part of the standard surface on
+/// every family.
+pub const EVM_KNOWN_BUILTINS: &[&str] = KNOWN_BUILTINS;
+
+pub const SVM_KNOWN_BUILTINS: &[&str] = &[
+    "now_ts",
+    "pow",
+    "balance_of",
+    "is_contract",
+    "is_eoa",
+    "spl_balance_of",
+    "spl_allowance",
+    "price_of",
+    "is_scam",
+    "is_approved_token",
+    "is_approved_spender",
+    "is_not_blocked_spender",
+];
+
+pub const SUI_KNOWN_BUILTINS: &[&str] = &[
+    "now_ts",
+    "pow",
+    "balance_of",
+    "is_contract",
+    "is_eoa",
+    "coin_balance",
+    "price_of",
+    "is_scam",
+    "is_approved_token",
+    "is_approved_spender",
+    "is_not_blocked_spender",
+];
+
+/// The builtin registry of a family (used by rule-load validation).
+pub const fn known_builtins(family: Family) -> &'static [&'static str] {
+    match family {
+        Family::Evm => EVM_KNOWN_BUILTINS,
+        Family::Svm => SVM_KNOWN_BUILTINS,
+        Family::Sui => SUI_KNOWN_BUILTINS,
+    }
+}
+
 /// Decimal block fields from `eth_getBlockByNumber` that are safe to access via `$block().field`.
 /// Also the whitelist for the `$block()` builtin's output — the builtin keeps only these fields.
 pub const BLOCK_FIELDS: &[&str] = &[
@@ -233,6 +278,28 @@ fn walk(
                 );
             }
             check_in_type_compat(val, list, family, param_types, var_values, errors);
+        }
+        Expr::InSource { val, source, .. } => {
+            // Static type checking is skipped: the source list's element kind
+            // is unknown at load time. Undefined-var checks still apply.
+            walk(
+                val,
+                family,
+                params,
+                builtins,
+                param_types,
+                var_values,
+                errors,
+            );
+            walk(
+                source,
+                family,
+                params,
+                builtins,
+                param_types,
+                var_values,
+                errors,
+            );
         }
         Expr::Builtin { name, args, path } => {
             if !builtins.contains(&name.as_str()) {
@@ -415,7 +482,16 @@ fn check_type_compat(
         {
             let expected = solidity_kind(solidity_type);
             if let Some(actual) = expr_kind(other_expr, family, var_values) {
-                if expected != actual && expected != "unknown" {
+                // A vars.* reference whose value is a string is a coercion
+                // candidate: the evaluator coerces decimal strings numerically
+                // (the YAML convention — `max: "1000000"` compares numerically
+                // against a u64 arg). Don't flag str-vs-num for those; a
+                // genuinely wrong var fails at eval time (fail-closed).
+                // Non-string var values (numbers, bools) still mismatch.
+                let is_str_var = matches!(other_expr, Expr::Attribute(parts)
+                    if parts.len() == 2 && parts[0].as_field() == Some("vars"))
+                    && var_value_is_string(other_expr, var_values);
+                if expected != actual && expected != "unknown" && !is_str_var {
                     let detail = format_other(other_expr, actual);
                     errors.push(SemanticError {
                         message: format!(
@@ -526,6 +602,18 @@ fn check_in_type_compat(
 
 fn is_args_attr(expr: &Expr) -> bool {
     matches!(expr, Expr::Attribute(parts) if parts.len() >= 2 && parts[0].as_field() == Some("args"))
+}
+
+/// True when `expr` is `vars.X` and the var's declared value is a JSON string.
+/// Unknown vars are false (they are reported by the undefined-var check).
+fn var_value_is_string(expr: &Expr, var_values: &HashMap<String, serde_json::Value>) -> bool {
+    match expr {
+        Expr::Attribute(parts) if parts.len() == 2 && parts[0].as_field() == Some("vars") => {
+            let name = parts[1].as_field().unwrap_or("");
+            var_values.get(name).is_some_and(|v| v.is_string())
+        }
+        _ => false,
+    }
 }
 
 fn solidity_type_for_args_attr<'a>(

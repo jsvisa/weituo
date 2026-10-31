@@ -172,6 +172,7 @@ pub fn parse_rules(raw: Vec<Rule>) -> HashMap<String, RuleEntry> {
             RuleEntry {
                 clauses,
                 abi_item: rule.abi_item,
+                family_abi: None,
                 multicall,
                 invalid_decoder,
             },

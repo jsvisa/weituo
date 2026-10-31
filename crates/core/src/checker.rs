@@ -156,6 +156,42 @@ impl DenyReason {
     }
 }
 
+/// EvalContext for one SVM instruction (design §6): chain_id/value stay 0,
+/// native amounts live in `args`, per-instruction synthetic data lives in
+/// `chain_fields`. Addresses are base58 — compared verbatim, never
+/// lowercased.
+#[cfg(feature = "svm")]
+fn svm_eval_ctx(
+    tx: &crate::svm::SvmTx,
+    ins: &crate::svm::SvmInstruction,
+    idx: usize,
+    num_instructions: usize,
+    network: String,
+    args: HashMap<String, serde_json::Value>,
+) -> EvalContext {
+    use alloy_primitives::U256;
+    let mut chain_fields = HashMap::new();
+    chain_fields.insert("accounts".to_string(), serde_json::json!(ins.accounts));
+    chain_fields.insert("signers".to_string(), serde_json::json!(tx.signers));
+    chain_fields.insert("instruction_index".to_string(), serde_json::json!(idx));
+    chain_fields.insert(
+        "num_instructions".to_string(),
+        serde_json::json!(num_instructions),
+    );
+    EvalContext {
+        chain_id: 0,
+        value: U256::ZERO,
+        args,
+        from_address: tx.from.clone(),
+        to_address: ins.program_id.clone(),
+        gas_price: 0,
+        gas_limit: 0,
+        vars: HashMap::new(),
+        network,
+        chain_fields,
+    }
+}
+
 /// Factory producing the `$`-builtin provider for one check. Receives the
 /// RPC URL resolved for the transaction's chain (`None` = unknown).
 pub type BuiltinsFactory =
@@ -188,10 +224,10 @@ fn evm_eval_ctx(
 /// and call [`Checker::check`] with a [`RuleResolver`] per transaction.
 fn lookup_rules(rules: &HashMap<String, RuleEntry>, selector: &str) -> RuleLookup {
     if let Some(e) = rules.get(selector) {
-        return RuleLookup::Found(e.clone());
+        return RuleLookup::Found(Box::new(e.clone()));
     }
     if let Some(e) = rules.get("*") {
-        return RuleLookup::Found(e.clone());
+        return RuleLookup::Found(Box::new(e.clone()));
     }
     if rules.is_empty() {
         RuleLookup::NoContract
@@ -212,7 +248,7 @@ pub struct Checker {
 
 /// Result of a rule lookup in a contract's rule map.
 enum RuleLookup {
-    Found(RuleEntry),
+    Found(Box<RuleEntry>),
     NoSelector,
     NoContract,
 }
@@ -245,8 +281,20 @@ impl Checker {
         Self {
             http,
             builtins_factory: None,
-            allowlist: allowlist.into_iter().map(|s| s.to_lowercase()).collect(),
+            // Stored verbatim: EVM comparisons are case-insensitive (hex),
+            // SVM base58 is case-sensitive — each family matches its way.
+            allowlist,
             policy,
+        }
+    }
+
+    /// Sender-allowlist match. EVM addresses are hex (case-insensitive);
+    /// SVM base58 and Sui (normalized at parse) compare verbatim.
+    fn allowlisted(&self, from: &str, case_insensitive: bool) -> bool {
+        if case_insensitive {
+            self.allowlist.iter().any(|a| a.eq_ignore_ascii_case(from))
+        } else {
+            self.allowlist.iter().any(|a| a == from)
         }
     }
 
@@ -289,9 +337,17 @@ impl Checker {
 
     /// Unified entry point: policy gates → per-call rule lookup → eval.
     pub async fn check_tx(&self, tx: &ChainTx, resolver: &dyn ChainResolver) -> CheckResult {
-        let ChainTx::Evm(tx) = tx;
-        self.check_evm(tx, ChainRef::Evm(tx.chain_id), resolver)
-            .await
+        match tx {
+            ChainTx::Evm(tx) => {
+                self.check_evm(tx, ChainRef::Evm(tx.chain_id), resolver)
+                    .await
+            }
+            #[cfg(feature = "svm")]
+            ChainTx::Svm(tx) => {
+                self.check_svm(tx, ChainRef::Svm(tx.network.clone()), resolver)
+                    .await
+            }
+        }
     }
 
     async fn check_evm(
@@ -336,6 +392,237 @@ impl Checker {
         CheckResult::Ok
     }
 
+    /// SVM pipeline (design §4/§9): one call per instruction — a transaction
+    /// *is* a multicall. Gate order per instruction: native-transfer gate →
+    /// rule lookup → token-op gate (only when lookup fails) → eval. The
+    /// allowlist bypass applies to the fee payer before any instruction is
+    /// inspected. SVM has no creation gate or EIP-2718 type gate.
+    #[cfg(feature = "svm")]
+    async fn check_svm(
+        &self,
+        tx: &crate::svm::SvmTx,
+        chain: ChainRef,
+        resolver: &dyn ChainResolver,
+    ) -> CheckResult {
+        use crate::svm::{
+            is_spl_token_program, is_system_transfer, spl_token_op_tag, svm_selector_candidates,
+        };
+
+        if self.allowlisted(&tx.from, false) {
+            return CheckResult::Ok;
+        }
+
+        let builtins = self.builtins_for(resolver, chain.clone());
+        let num_instructions = tx.instructions.len();
+        for (idx, ins) in tx.instructions.iter().enumerate() {
+            let display_addr = format!("{} (instruction[{idx}])", ins.program_id);
+
+            // Native-transfer gate: ALL System::Transfer instructions when
+            // policy allows (design §9). Otherwise they fall through to rule
+            // lookup like any other instruction.
+            if ins.program_id == crate::svm::SYSTEM_PROGRAM
+                && is_system_transfer(&ins.data)
+                && self.policy.allow_native_transfer
+            {
+                continue;
+            }
+
+            // Rule lookup (design §9): candidates longest-first, then `*`.
+            // On any failure the token-op gate runs BEFORE the failure is
+            // surfaced — same ordering as the EVM pipeline's
+            // `step_rule_lookup → step_token_op` fallback.
+            let candidates = svm_selector_candidates(&ins.data);
+            let miss: Option<DenyReason> = match &resolver
+                .contract_rules(chain.clone(), &ins.program_id)
+                .await
+            {
+                Some(rules) => {
+                    let mut found: Option<(String, crate::types::RuleEntry)> = None;
+                    for sel in &candidates {
+                        if let Some(entry) = rules.get(sel) {
+                            found = Some((sel.clone(), entry.clone()));
+                            break;
+                        }
+                    }
+                    match found.or_else(|| rules.get("*").map(|e| ("*".to_string(), e.clone()))) {
+                        Some((selector, entry)) => {
+                            if let Err(reason) = self
+                                .svm_eval_instruction(
+                                    tx,
+                                    ins,
+                                    idx,
+                                    num_instructions,
+                                    &chain,
+                                    selector,
+                                    entry,
+                                    &builtins,
+                                )
+                                .await
+                            {
+                                return CheckResult::Denied(reason);
+                            }
+                            continue;
+                        }
+                        None if rules.is_empty() => Some(DenyReason::NoContract {
+                            address: display_addr,
+                            chain_id: 0,
+                        }),
+                        None => Some(DenyReason::NoRule {
+                            address: display_addr,
+                            selector: candidates
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "0x".to_string()),
+                        }),
+                    }
+                }
+                None => Some(DenyReason::NoContract {
+                    address: display_addr,
+                    chain_id: 0,
+                }),
+            };
+            let Some(reason) = miss else {
+                continue; // instruction passed via its rule
+            };
+            // Token-op gate — only when rule lookup failed (design §9).
+            if is_spl_token_program(&ins.program_id) {
+                if let Some(tag) = spl_token_op_tag(&ins.data) {
+                    match self.policy.token_op_policy {
+                        TokenOpPolicy::AllowAll => continue,
+                        TokenOpPolicy::DenyAll => {
+                            return CheckResult::Denied(DenyReason::TokenOpDenied {
+                                selector: format!("0x{tag:02x}"),
+                            });
+                        }
+                        // Whitelist/RequireRule fall through to the lookup
+                        // failure (a missing rule then denies with it).
+                        TokenOpPolicy::Whitelist | TokenOpPolicy::RequireRule => {}
+                    }
+                }
+            }
+            return CheckResult::Denied(reason);
+        }
+        CheckResult::Ok
+    }
+
+    /// Evaluate one SVM instruction's rule clauses (shared by `check_svm`).
+    /// Returns `Ok(())` when a clause passed; `Err(reason)` carries the
+    /// denial (eval error or expression denied) with the instruction index
+    /// baked into the message.
+    #[cfg(feature = "svm")]
+    #[allow(clippy::too_many_arguments)]
+    async fn svm_eval_instruction(
+        &self,
+        tx: &crate::svm::SvmTx,
+        ins: &crate::svm::SvmInstruction,
+        idx: usize,
+        num_instructions: usize,
+        chain: &ChainRef,
+        selector: String,
+        entry: crate::types::RuleEntry,
+        builtins: &Arc<dyn weituo_expr::context::BuiltinProvider>,
+    ) -> Result<(), DenyReason> {
+        let where_ = format!("instruction[{idx}] ");
+        // Decode args with the rule's Anchor IDL fragment. Decode failures
+        // fail closed: args stay empty and any expression referencing them
+        // errors (deny).
+        let args = match &entry.family_abi {
+            Some(abi @ crate::types::FamilyAbi::Svm { .. }) => {
+                crate::svm::decode_svm_args(abi, &selector, &ins.data).unwrap_or_default()
+            }
+            _ => Default::default(),
+        };
+
+        let ctx = svm_eval_ctx(
+            tx,
+            ins,
+            idx,
+            num_instructions,
+            chain.to_family_network(),
+            args,
+        );
+
+        let mut any_passed = false;
+        let mut last_denied = String::new();
+        let mut last_failing = None;
+        'clauses: for clause in &entry.clauses {
+            let mut instr_ctx = ctx.clone();
+            instr_ctx.vars = clause.vars.clone();
+            for expr_str in clause.expr.exprs() {
+                match expr::evaluate_explain(expr_str, &instr_ctx, Arc::clone(builtins)).await {
+                    Ok((true, _)) => {}
+                    Ok((false, explain)) => {
+                        last_denied = format!("{where_}{expr_str}");
+                        last_failing = explain;
+                        continue 'clauses;
+                    }
+                    Err(e) => {
+                        return Err(DenyReason::EvalError(format!("{where_}{e}")));
+                    }
+                }
+            }
+            any_passed = true;
+            break;
+        }
+        if !any_passed {
+            return Err(DenyReason::ExpressionDenied {
+                expr: last_denied,
+                explain: last_failing,
+            });
+        }
+        Ok(())
+    }
+
+    /// `waf_testRule` for SVM: evaluate the caller-supplied expr against every
+    /// instruction using the inline ABI (`SvmTx.abi`). No policy gates — the
+    /// EVM test path skips them the same way.
+    #[cfg(feature = "svm")]
+    async fn test_svm(
+        &self,
+        tx: &crate::svm::SvmTx,
+        resolver: Option<&dyn ChainResolver>,
+    ) -> CheckResult {
+        let expr_str = match &tx.expr {
+            Some(e) => e.clone(),
+            None => return CheckResult::Denied(DenyReason::NoExprInTest),
+        };
+        let builtins = self.builtins_for_opt(resolver, ChainRef::Svm(tx.network.clone()));
+        let num_instructions = tx.instructions.len();
+        for (idx, ins) in tx.instructions.iter().enumerate() {
+            let args = match &tx.abi {
+                Some(abi) => {
+                    let selector = crate::svm::func_selector_from_abi_name(abi);
+                    crate::svm::decode_svm_args(abi, &selector, &ins.data).unwrap_or_default()
+                }
+                None => Default::default(),
+            };
+            let mut ctx = svm_eval_ctx(
+                tx,
+                ins,
+                idx,
+                num_instructions,
+                ChainRef::Svm(tx.network.clone()).to_family_network(),
+                args,
+            );
+            ctx.vars = tx.vars.clone().unwrap_or_default();
+            match expr::evaluate_explain(&expr_str, &ctx, Arc::clone(&builtins)).await {
+                Ok((true, _)) => {}
+                Ok((false, explain)) => {
+                    return CheckResult::Denied(DenyReason::ExpressionDenied {
+                        expr: format!("instruction[{idx}] {expr_str}"),
+                        explain,
+                    });
+                }
+                Err(e) => {
+                    return CheckResult::Denied(DenyReason::EvalError(format!(
+                        "instruction[{idx}]: {e}"
+                    )));
+                }
+            }
+        }
+        CheckResult::Ok
+    }
+
     fn step_transaction_type(&self, tx: &Transaction) -> Option<CheckResult> {
         let transaction_type = tx.transaction_type?;
         if self.policy.transaction_types.contains(&transaction_type) {
@@ -348,7 +635,7 @@ impl Checker {
     }
 
     fn step_allowlist(&self, tx: &Transaction) -> Option<CheckResult> {
-        if self.allowlist.contains(&tx.from.to_lowercase()) {
+        if self.allowlisted(&tx.from, true) {
             Some(CheckResult::Ok)
         } else {
             None
@@ -422,7 +709,7 @@ impl Checker {
             });
         };
         match lookup_rules(&rules, selector) {
-            RuleLookup::Found(e) => Ok(e),
+            RuleLookup::Found(e) => Ok(*e),
             RuleLookup::NoSelector => Err(DenyReason::NoRule {
                 address: tx.to.clone(),
                 selector: selector.to_string(),
@@ -735,7 +1022,7 @@ impl Checker {
             });
         };
         let inner_entry = match lookup_rules(&rules, selector) {
-            RuleLookup::Found(e) => e,
+            RuleLookup::Found(e) => *e,
             RuleLookup::NoSelector => {
                 return Err(DenyReason::NoRule {
                     address: inner_address,
@@ -816,7 +1103,7 @@ impl Checker {
         };
 
         // 2. Sender allowlist bypass
-        if self.allowlist.contains(&req.from.to_lowercase()) {
+        if self.allowlisted(&req.from, true) {
             return CheckResult::Ok;
         }
 
@@ -965,7 +1252,18 @@ impl Checker {
     /// Unified test-mode preview (mirrors [`Checker::test`]): inline `abi` on
     /// the transaction plays the role of `Transaction.abi` today.
     pub async fn test_tx(&self, tx: &ChainTx, resolver: Option<&dyn ChainResolver>) -> CheckResult {
-        let ChainTx::Evm(tx) = tx;
+        match tx {
+            ChainTx::Evm(tx) => self.test_evm(tx, resolver).await,
+            #[cfg(feature = "svm")]
+            ChainTx::Svm(tx) => self.test_svm(tx, resolver).await,
+        }
+    }
+
+    async fn test_evm(
+        &self,
+        tx: &Transaction,
+        resolver: Option<&dyn ChainResolver>,
+    ) -> CheckResult {
         if let Some(r) = self.step_transaction_type(tx) {
             return r;
         }
@@ -1332,6 +1630,7 @@ mod stateless_tests {
                 vars: HashMap::new(),
             }],
             abi_item: None,
+            family_abi: None,
             multicall: None,
             invalid_decoder: false,
         }
