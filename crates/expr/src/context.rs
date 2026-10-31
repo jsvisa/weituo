@@ -24,6 +24,12 @@ pub struct EvalContext {
     /// per-call indexes, …). Resolvable as bare identifiers and attribute
     /// paths (`accounts[1]`, `accounts.length`).
     pub chain_fields: HashMap<String, JsonValue>,
+    /// String equality semantics for `==` / `in`: hex addresses are
+    /// case-insensitive (EVM, Sui — both sides are normalized lowercase at
+    /// parse time anyway), but SVM base58 encodings are case-sensitive and
+    /// case variants denote *different* pubkeys, so SVM contexts set this
+    /// to `false` (verbatim comparison).
+    pub case_insensitive_str_eq: bool,
 }
 
 impl Default for EvalContext {
@@ -39,6 +45,7 @@ impl Default for EvalContext {
             vars: HashMap::new(),
             network: String::new(),
             chain_fields: HashMap::new(),
+            case_insensitive_str_eq: true,
         }
     }
 }
@@ -56,6 +63,7 @@ impl EvalContext {
             vars: HashMap::new(),
             network: String::new(),
             chain_fields: HashMap::new(),
+            case_insensitive_str_eq: true,
         }
     }
 }

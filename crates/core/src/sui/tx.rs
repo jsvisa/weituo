@@ -143,10 +143,13 @@ fn parse_argument(v: &Json) -> Result<SuiArgument, String> {
             }
             if let Some(pair) = o.get("NestedResult").and_then(Json::as_array) {
                 if pair.len() == 2 {
-                    return Ok(SuiArgument::NestedResult(
-                        pair[0].as_u64().unwrap_or(0) as usize,
-                        pair[1].as_u64().unwrap_or(0) as usize,
-                    ));
+                    // Malformed indices must not silently become 0 (which
+                    // could alias a real result slot) — fail the parse.
+                    let (a, b) = (pair[0].as_u64(), pair[1].as_u64());
+                    if let (Some(a), Some(b)) = (a, b) {
+                        return Ok(SuiArgument::NestedResult(a as usize, b as usize));
+                    }
+                    return Err("NestedResult indices must be non-negative integers".to_string());
                 }
                 return Err("NestedResult must be [command, result]".to_string());
             }
@@ -449,6 +452,17 @@ pub(crate) fn encode_pure_input(value_type: &str, value: &Json) -> Result<Vec<u8
         "u8" | "u16" | "u32" | "u64" | "u128" | "u256" => {
             let width = int_width(value_type);
             let n = json_to_uint(value, value_type)?;
+            // Fail closed on out-of-range values instead of silently
+            // truncating to the declared width (a u8 "300" must not become
+            // 44). u256 spans the full U256, so no mask is needed there.
+            if width < 32 {
+                let max = (alloy_primitives::U256::from(1u8) << (8 * width as u32))
+                    .checked_sub(alloy_primitives::U256::from(1u8))
+                    .ok_or_else(|| format!("{value_type} value out of range"))?;
+                if n > max {
+                    return Err(format!("{value_type} value out of range: {n}"));
+                }
+            }
             let mut buf = [0u8; 32];
             buf[..32].copy_from_slice(&n.to_le_bytes::<32>());
             Ok(buf[..width].to_vec())
@@ -696,11 +710,16 @@ pub fn decode_sui_args_typed(
 
 // ── Native-transfer dataflow helpers (design §8.3, used by the checker) ─────
 
-/// Decode one `u64` pure input to its decimal string.
+/// Decode one `u64` pure input to its decimal string. The declared
+/// `valueType` must match — a differently-typed input is not an amount
+/// this helper may reinterpret (fail closed).
 pub(crate) fn sui_pure_u64(inputs: &[SuiInput], idx: usize) -> Option<String> {
-    let SuiInput::Pure { bytes, .. } = inputs.get(idx)? else {
+    let SuiInput::Pure { value_type, bytes } = inputs.get(idx)? else {
         return None;
     };
+    if value_type != "u64" {
+        return None;
+    }
     let mut r = BcsReader::new(bytes);
     match decode_bcs("u64", &mut r) {
         Ok(Json::String(s)) => Some(s),
@@ -709,7 +728,8 @@ pub(crate) fn sui_pure_u64(inputs: &[SuiInput], idx: usize) -> Option<String> {
 }
 
 /// Recipient of a `TransferObjects` command: `Input(i)` pointing at an
-/// object input (the id) or an `address` pure input.
+/// `address`-typed pure input. Object inputs carry an object id, not a
+/// wallet address, so they are not accepted as transfer recipients.
 pub(crate) fn sui_recipient(inputs: &[SuiInput], cmd: &SuiCommand) -> Option<String> {
     let SuiCommand::TransferObjects {
         address: SuiArgument::Input(idx),
@@ -718,26 +738,31 @@ pub(crate) fn sui_recipient(inputs: &[SuiInput], cmd: &SuiCommand) -> Option<Str
     else {
         return None;
     };
-    match inputs.get(*idx)? {
-        SuiInput::Object { object_id } => Some(object_id.clone()),
-        SuiInput::Pure { bytes, .. } => {
-            let mut r = BcsReader::new(bytes);
-            match decode_bcs("address", &mut r) {
-                Ok(Json::String(s)) => Some(s),
-                _ => None,
-            }
-        }
+    let SuiInput::Pure { value_type, bytes } = inputs.get(*idx)? else {
+        return None;
+    };
+    if value_type != "address" {
+        return None;
+    }
+    let mut r = BcsReader::new(bytes);
+    match decode_bcs("address", &mut r) {
+        Ok(Json::String(s)) => Some(s),
+        _ => None,
     }
 }
 
 /// Decode a `vector<u64>` / `vector<address>` pure input (the `pay_sui`
 /// amounts / recipients arguments) to decimal strings / full-hex addresses.
+/// The declared `valueType` must match the expected element type.
 pub(crate) fn sui_pure_vector(inputs: &[SuiInput], idx: usize, elem: &str) -> Option<Vec<String>> {
-    let SuiInput::Pure { bytes, .. } = inputs.get(idx)? else {
+    let SuiInput::Pure { value_type, bytes } = inputs.get(idx)? else {
         return None;
     };
+    if value_type.as_str() != format!("vector<{elem}>") {
+        return None;
+    }
     let mut r = BcsReader::new(bytes);
-    match decode_bcs(&format!("vector<{elem}>"), &mut r) {
+    match decode_bcs(value_type, &mut r) {
         Ok(Json::Array(items)) => items
             .into_iter()
             .map(|v| match v {

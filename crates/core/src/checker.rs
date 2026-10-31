@@ -189,6 +189,9 @@ fn svm_eval_ctx(
         vars: HashMap::new(),
         network,
         chain_fields,
+        // base58 is case-sensitive: case variants are different pubkeys,
+        // so string equality must compare verbatim.
+        case_insensitive_str_eq: false,
     }
 }
 
@@ -229,6 +232,9 @@ fn sui_eval_ctx(
         vars: HashMap::new(),
         network,
         chain_fields,
+        // Hex addresses are case-insensitive; both sides are already
+        // normalized to full lowercase hex at parse time.
+        case_insensitive_str_eq: true,
     }
 }
 
@@ -257,6 +263,7 @@ fn evm_eval_ctx(
         vars,
         network: format!("eip155:{}", tx.chain_id),
         chain_fields: HashMap::new(),
+        case_insensitive_str_eq: true,
     }
 }
 
@@ -1583,6 +1590,7 @@ impl Checker {
                 vars: clause.vars.clone(),
                 network: format!("eip155:{}", req.domain.chain_id),
                 chain_fields: HashMap::new(),
+                case_insensitive_str_eq: true,
             };
             for expr_str in clause.expr.exprs() {
                 match expr::evaluate_explain(expr_str, &ctx, Arc::clone(cx.builtins)).await {
@@ -1779,6 +1787,7 @@ impl Checker {
                         vars: ctx.vars.clone(),
                         network: ctx.network.clone(),
                         chain_fields: HashMap::new(),
+                        case_insensitive_str_eq: ctx.case_insensitive_str_eq,
                     };
 
                     match expr::evaluate_explain(&expr_str, &inner_ctx, Arc::clone(&builtins)).await
