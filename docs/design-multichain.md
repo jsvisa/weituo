@@ -153,7 +153,10 @@ Design decisions:
   reference unresolved ALT indexes is rejected as `InvalidRequest`.
 - `data` accepts base58 (wallet/RPC convention) and `0x`-hex (engine
   convention); decoders normalize internally.
-- `from` is the fee payer (first required signer).
+- `from` is the fee payer (first required signer). Optional `signers`
+  (base58 list, defaults to `["<from>"]`) exposes the full signer set to
+  rules via `chain_fields.signers`; it does not change the fee payer or
+  `from_address`.
 - Optional `raw` (base64 `VersionedTransaction`) may be accepted later for
   embedding-side convenience; core still only consumes the decoded form.
 
@@ -174,7 +177,7 @@ Design decisions:
   ],
   "commands": [
     {"MoveCall": {"target": "0x2::pay::split", "typeArguments": ["0x2::sui::SUI"],
-                  "arguments": [{"GasCoin"}, {"Input": 0}]}},
+                  "arguments": [{"GasCoin": true}, {"Input": 0}]}},
     {"TransferObjects": {"objects": [{"Result": 0}], "address": {"Input": 1}}}
   ]
 }
@@ -494,8 +497,8 @@ rule's IDL fragment), so both are **hand-rolled byte-slice decoders** — no
     LE ints, `address` = 32 raw bytes (rendered full-hex), `vector<T>` =
     ULEB128 length prefix, `string` = `vector<u8>`, option = tag byte.
   - `{"Input": i}` + object input → the object id string (type `address`).
-  - `{"GasCoin"}` → sentinel string `"0x2::sui::SUI"` (a gas coin *is* a SUI
-    coin).
+  - `{"GasCoin": true}` → sentinel string `"0x2::sui::SUI"` (a gas coin *is* a
+    SUI coin; a bare `{"GasCoin"}` shorthand is not valid JSON).
   - `{"Result": n}` / `{"NestedResult": …}` → unresolved in v1: the arg is
     `null`, and the rule-load validator **rejects rules that reference a
     parameter receiving an inter-command result** unless the command pair is

@@ -2,19 +2,19 @@
 name = "weituo-core"
 version.workspace = true
 edition = "2021"
-description = "Reusable EVM WAF rule-check engine: rules, DSL builtins, checker (no HTTP server)"
+description = "Reusable multichain (EVM/SVM/Sui) WAF rule-check engine: rules, DSL builtins, checker (no HTTP server)"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 readme = "README.md"
-keywords = ["waf", "ethereum", "evm", "security", "rules"]
+keywords = ["waf", "ethereum", "evm", "solana", "sui"]
 categories = ["web-programming", "cryptography::cryptocurrencies"]
 
 [lints]
 workspace = true
 
 [dependencies]
-weituo-expr      = { path = "../expr", version = "0.2.5" }
+weituo-expr      = { path = "../expr", version = "0.3.0" }
 anyhow           = { workspace = true }
 thiserror        = { workspace = true }
 serde            = { workspace = true }
