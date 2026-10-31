@@ -2,7 +2,10 @@
 
 [![CI](https://github.com/jsvisa/weituo/actions/workflows/ci.yml/badge.svg)](https://github.com/jsvisa/weituo/actions/workflows/ci.yml)
 
-Reusable Rust libraries for **EVM transaction and signature rule checking**.
+Reusable Rust libraries for **multichain transaction and signature rule
+checking** — EVM, SVM (Solana) and Sui — with one rule DSL and one
+`Checker` API per family (see
+[`docs/design-multichain.md`](docs/design-multichain.md)).
 
 The service layer — HTTP JSON-RPC server, request authentication, metrics,
 concrete rule providers and their caches, price oracles, scam lists — is
@@ -34,7 +37,7 @@ crates/
 
 ```toml
 [dependencies]
-weituo-core = "0.2"
+weituo-core = "0.3"
 reqwest     = "0.12"   # used by the engine's $-builtins for chain RPC
 tokio       = "1"
 anyhow      = "1"
@@ -87,6 +90,30 @@ A compiling version lives in
 [`crates/core/examples/embed_checker.rs`](crates/core/examples/embed_checker.rs)
 (`cargo run -p weituo-core --example embed_checker`).
 
+## Multichain (SVM / Sui)
+
+The same `Checker` also validates Solana instructions and Sui programmable
+transaction blocks. The unified entry point takes a `ChainTx` (a JSON payload
+tagged with `"chain": "svm" | "sui"` — absent means legacy EVM):
+
+```rust
+use weituo_core::{chain::ChainTx, checker::CheckResult};
+
+// {"chain": "sui", "chainId": "mainnet", "from": "0x…",
+//  "inputs": […], "commands": [{"MoveCall": {…}}]}
+let tx = ChainTx::from_json(&tx_json)?;
+match checker.check_tx(&tx, &resolver).await {
+    CheckResult::Ok => println!("allowed"),
+    CheckResult::Denied(reason) => println!("denied: {reason}"),
+}
+```
+
+Family support is feature-gated in `weituo-core` (`svm` and `sui` are
+enabled by default; EVM checking never changes). Rule keys and payload
+shapes per family are specified in
+[`docs/design-multichain.md`](docs/design-multichain.md) (§3 wire format,
+§5 rule keys, §8 decoders).
+
 ## Architecture
 
 ```
@@ -120,7 +147,7 @@ publishes both crates (`weituo-expr` first, then `weituo-core`). The tag must
 match the `version` in the root `Cargo.toml`.
 
 ```sh
-git tag v0.2.5 && git push origin v0.2.5
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 To publish manually instead, go in dependency order; run each dry run first:
