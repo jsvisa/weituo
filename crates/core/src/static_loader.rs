@@ -12,7 +12,8 @@ use crate::chain::ChainRef;
 use crate::decoder::build_decoder;
 use crate::provider::ChainInfo;
 use crate::types::{
-    normalize_domain_name, AbiItem, DecoderKind, ExprValue, MulticallDecoder, RuleClause, RuleEntry,
+    normalize_domain_name, AbiItem, DecoderKind, ExprValue, FamilyAbi, MulticallDecoder,
+    RuleClause, RuleEntry,
 };
 
 // ── YAML deserialization types ────────────────────────────────────────────────
@@ -171,12 +172,22 @@ pub fn load_multi(
         let mut allowlisted: HashSet<String> = HashSet::new();
         for rule in contract.allowlist {
             let selector = func_selector(&chain, &rule.func);
+            // Non-EVM contracts use family ABI fragments (Anchor IDL / Move
+            // signature); EVM keeps AbiItem + the abi_dir file lookup.
+            let family_abi: Option<FamilyAbi> = match &chain {
+                ChainRef::Evm(_) => None,
+                _ => rule
+                    .abi
+                    .as_ref()
+                    .and_then(|v| family_abi_from_yaml(&chain, yaml_to_json(v.clone()))),
+            };
             let abi_item = rule
                 .abi
                 .as_ref()
+                .filter(|_| matches!(chain, ChainRef::Evm(_)))
                 .and_then(|v| serde_json::from_value::<AbiItem>(yaml_to_json(v.clone())).ok())
                 .or_else(|| load_abi(abi_dir, &chain, &selector));
-            if abi_item.is_none() {
+            if abi_item.is_none() && family_abi.is_none() {
                 warn!(func = %rule.func, selector, "no ABI found — args.* will be empty");
             }
             let expr_json = yaml_to_json(rule.expr);
@@ -193,6 +204,13 @@ pub fn load_multi(
                 .into_iter()
                 .map(|(k, v)| (k, yaml_to_json(v)))
                 .collect();
+            // Load-time validation for non-EVM rules: per-family context
+            // fields, per-family builtin set (a `$erc20_*` reference on an
+            // SVM contract fails here, not at check time).
+            if let Err(msg) = validate_family_rule(&chain, &expr, &family_abi, &vars) {
+                warn!(func = %rule.func, "skipping rule: {msg}");
+                continue;
+            }
             let multicall = mc_map.get(&selector).cloned();
             allowlisted.insert(selector.clone());
             slot.insert(
@@ -200,6 +218,7 @@ pub fn load_multi(
                 RuleEntry {
                     clauses: vec![RuleClause { expr, vars }],
                     abi_item,
+                    family_abi,
                     multicall,
                     invalid_decoder: false,
                 },
@@ -220,6 +239,7 @@ pub fn load_multi(
                             vars: HashMap::new(),
                         }],
                         abi_item,
+                        family_abi: None,
                         multicall: Some(decoder),
                         invalid_decoder: false,
                     },
@@ -267,10 +287,9 @@ fn parse_chain_ref(spec: &str) -> Result<ChainRef> {
 /// `func` → rule-map selector, per family:
 /// - EVM: `*`/`fallback()` → wildcard, `receive()` → `"0x"`, `X::Y` →
 ///   EIP-712 `domain::primaryType`, else 4-byte keccak selector.
+/// - SVM: hex funcs verbatim (non-Anchor tag prefixes), else Anchor
+///   discriminator `sha256("global:" + snake_case(name))[..8]`.
 /// - Sui: `"module::function"` lowercased as written.
-/// - SVM: hex funcs verbatim (non-Anchor tag prefixes); named funcs are
-///   stored as-is until the `svm` feature adds Anchor discriminator
-///   computation at load.
 fn func_selector(chain: &ChainRef, func: &str) -> String {
     match chain {
         ChainRef::Evm(_) => {
@@ -285,7 +304,77 @@ fn func_selector(chain: &ChainRef, func: &str) -> String {
                 selector_for(func)
             }
         }
-        ChainRef::Sui(_) | ChainRef::Svm(_) => func.to_lowercase(),
+        // Without the `svm` feature the Anchor discriminator is unavailable;
+        // fall back to the verbatim func. No SVM transaction can be checked
+        // without the feature anyway, so rules simply never match.
+        #[cfg(feature = "svm")]
+        ChainRef::Svm(_) => crate::svm::func_selector(func),
+        #[cfg(not(feature = "svm"))]
+        ChainRef::Svm(_) => func.to_lowercase(),
+        ChainRef::Sui(_) => func.to_lowercase(),
+    }
+}
+
+/// Parse the YAML `abi:` value into a [`FamilyAbi`] for the contract's family.
+fn family_abi_from_yaml(chain: &ChainRef, v: serde_json::Value) -> Option<FamilyAbi> {
+    let parsed = match chain {
+        ChainRef::Svm(_) => FamilyAbi::from_svm_json(v.clone()),
+        ChainRef::Sui(_) => FamilyAbi::from_sui_json(v.clone()),
+        ChainRef::Evm(_) => None,
+    };
+    if parsed.is_none() {
+        warn!(chain = %chain.to_family_network(), "failed to parse abi fragment for this chain family");
+    }
+    parsed
+}
+
+/// Load-time semantic validation for non-EVM rules: per-family context
+/// fields, per-family builtin set, and address-literal rules. Returns the
+/// error message on the first failure. EVM rules keep today's permissive
+/// static-load behavior (embedding-provided builtins are unknowable).
+fn validate_family_rule(
+    chain: &ChainRef,
+    expr: &ExprValue,
+    family_abi: &Option<FamilyAbi>,
+    vars: &HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let family = match chain {
+        ChainRef::Evm(_) => return Ok(()),
+        ChainRef::Svm(_) => weituo_expr::analyze::Family::Svm,
+        ChainRef::Sui(_) => weituo_expr::analyze::Family::Sui,
+    };
+    let (param_names, param_types): (Vec<&str>, HashMap<String, String>) = match family_abi {
+        Some(FamilyAbi::Svm { args, .. }) | Some(FamilyAbi::Sui { params: args }) => (
+            args.iter().map(|a| a.name.as_str()).collect(),
+            args.iter()
+                .map(|a| (a.name.clone(), idl_type_label(&a.ty)))
+                .collect(),
+        ),
+        None => (Vec::new(), HashMap::new()),
+    };
+    for expr_str in expr.exprs() {
+        let errors = weituo_expr::validate_full_for(
+            expr_str,
+            family,
+            &param_names,
+            weituo_expr::analyze::known_builtins(family),
+            &param_types,
+            vars,
+        );
+        if let Some(first) = errors.first() {
+            return Err(first.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Type label for semantic validation of a non-EVM arg: primitive strings
+/// pass through (the expr analyzer understands `u64`, `pubkey`, `bool`, …);
+/// structured renderings become an opaque label the analyzer skips.
+fn idl_type_label(ty: &serde_json::Value) -> String {
+    match ty {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 

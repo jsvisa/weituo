@@ -38,6 +38,7 @@ fn approve_rule(expr: &str) -> RuleEntry {
             vars: HashMap::new(),
         }],
         abi_item: Some(abi),
+        family_abi: None,
         multicall: None,
         invalid_decoder: false,
     }
@@ -264,6 +265,7 @@ fn from_json_absent_chain_is_legacy_evm() {
             assert_eq!(t.chain_id, 1);
             assert_eq!(t.to, TOKEN);
         }
+        ChainTx::Svm(_) => panic!("expected Evm"),
     }
 }
 
@@ -276,6 +278,7 @@ fn from_json_explicit_evm_chain() {
     let tx = ChainTx::from_json(&v).unwrap();
     match tx {
         ChainTx::Evm(t) => assert_eq!(t.chain_id, 1),
+        ChainTx::Svm(_) => panic!("expected Evm"),
     }
 }
 

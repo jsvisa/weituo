@@ -361,6 +361,65 @@ pub struct AbiItem {
     pub state_mutability: String,
 }
 
+/// Family-specific ABI fragment for non-EVM rules. Pure data — the
+/// feature-gated decoders in `svm` / `sui` interpret it.
+#[derive(Debug, Clone)]
+pub enum FamilyAbi {
+    /// Anchor-style IDL fragment: `{ name, args: [{name, type}], types? }`.
+    /// `types` resolves `{defined: …}` references (same spirit as EVM tuple
+    /// `components`).
+    Svm {
+        name: String,
+        args: Vec<IdlArg>,
+        types: HashMap<String, serde_json::Value>,
+    },
+    /// Move signature fragment: `{ params: [{name, type}] }`.
+    Sui { params: Vec<IdlArg> },
+}
+
+/// One named, typed parameter of a non-EVM ABI fragment. `ty` keeps the raw
+/// JSON rendering (string for primitives, object for `option`/`vec`/`array`/
+/// `defined`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdlArg {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: serde_json::Value,
+}
+
+impl FamilyAbi {
+    /// Parse an SVM Anchor IDL fragment: `{ name, args: [{name, type}], types? }`.
+    /// `args` and `name` are optional (argless programs / bare tag rules).
+    pub fn from_svm_json(v: serde_json::Value) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Frag {
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            args: Vec<IdlArg>,
+            #[serde(default)]
+            types: HashMap<String, serde_json::Value>,
+        }
+        let f: Frag = serde_json::from_value(v).ok()?;
+        Some(Self::Svm {
+            name: f.name,
+            args: f.args,
+            types: f.types,
+        })
+    }
+
+    /// Parse a Sui Move signature fragment: `{ params: [{name, type}] }`.
+    pub fn from_sui_json(v: serde_json::Value) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Frag {
+            #[serde(default)]
+            params: Vec<IdlArg>,
+        }
+        let f: Frag = serde_json::from_value(v).ok()?;
+        Some(Self::Sui { params: f.params })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AbiInput {
     #[serde(default)]
@@ -434,6 +493,10 @@ pub struct RuleClauseRaw {
 pub struct RuleEntry {
     pub clauses: Vec<RuleClause>,
     pub abi_item: Option<AbiItem>,
+    /// Family-specific ABI fragment for non-EVM rules (SVM Anchor IDL, Sui
+    /// Move signature). EVM rules keep `abi_item`; when `family_abi` is set
+    /// the checker decodes with it and ignores `abi_item`.
+    pub family_abi: Option<FamilyAbi>,
     pub multicall: Option<MulticallDecoder>,
     /// True when decoder_config was present but decoder_type was unrecognised.
     /// The checker must deny rather than silently skip inner-call inspection.

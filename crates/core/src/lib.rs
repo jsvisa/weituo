@@ -27,6 +27,8 @@ pub mod parse_rule;
 pub mod policy;
 pub mod provider;
 pub mod static_loader;
+#[cfg(feature = "svm")]
+pub mod svm;
 pub mod types;
 
 pub use weituo_expr;

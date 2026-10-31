@@ -26,6 +26,15 @@ alloy-primitives = "1"
 hex              = "0.4"
 reqwest          = { version = "0.12", features = ["json"] }
 serde_yaml       = "0.9"
+base58           = { version = "0.2", optional = true }
+sha2             = { version = "0.10", optional = true }
+
+[features]
+default = ["svm", "sui"]
+# SVM support: base58 (address/data encoding) + sha2 (Anchor discriminators)
+svm = ["dep:base58", "dep:sha2"]
+# Sui support (phase 3)
+sui = []
 
 [dev-dependencies]
 tempfile = "3"
