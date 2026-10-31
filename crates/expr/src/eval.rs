@@ -295,14 +295,18 @@ impl Evaluator {
             Expr::BinOp { op, lhs, rhs } => {
                 let l = self.eval_inner(lhs, ctx).await?;
                 let r = self.eval_inner(rhs, ctx).await?;
-                eval_binop(op, &l, &r)
+                eval_binop(op, &l, &r, ctx.case_insensitive_str_eq)
             }
 
             Expr::In { val, list, negated } => {
                 let v = self.eval_inner(val, ctx).await?;
                 let mut found = false;
                 for item in list {
-                    if values_eq(&v, &self.eval_inner(item, ctx).await?) {
+                    if values_eq(
+                        &v,
+                        &self.eval_inner(item, ctx).await?,
+                        ctx.case_insensitive_str_eq,
+                    ) {
                         found = true;
                         break;
                     }
@@ -338,9 +342,9 @@ impl Evaluator {
                         ))
                     }
                 };
-                let found = items
-                    .iter()
-                    .any(|item| values_eq(&v, &Value::from(item.clone())));
+                let found = items.iter().any(|item| {
+                    values_eq(&v, &Value::from(item.clone()), ctx.case_insensitive_str_eq)
+                });
                 Ok(Value::Bool(if *negated { !found } else { found }))
             }
 
@@ -526,7 +530,7 @@ fn render_operand(v: &Value) -> String {
     }
 }
 
-fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> Result<Value> {
+fn eval_binop(op: &BinOp, l: &Value, r: &Value, case_insensitive: bool) -> Result<Value> {
     if op == &BinOp::Regex {
         let s = match l {
             Value::Str(s) => s,
@@ -567,15 +571,24 @@ fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> Result<Value> {
     }
 
     Ok(Value::Bool(match op {
-        BinOp::Eq => values_eq(l, r),
-        BinOp::Ne => !values_eq(l, r),
+        BinOp::Eq => values_eq(l, r, case_insensitive),
+        BinOp::Ne => !values_eq(l, r, case_insensitive),
         _ => return Err(anyhow!("{op:?} not supported for {}", l.type_name())),
     }))
 }
 
-pub fn values_eq(a: &Value, b: &Value) -> bool {
+/// String equality under the context's case sensitivity: EVM/Sui hex
+/// addresses compare case-insensitively; SVM base58 compares verbatim
+/// (case variants are different pubkeys).
+pub fn values_eq(a: &Value, b: &Value, case_insensitive: bool) -> bool {
     match (a, b) {
-        (Value::Str(s1), Value::Str(s2)) => s1.to_lowercase() == s2.to_lowercase(),
+        (Value::Str(s1), Value::Str(s2)) => {
+            if case_insensitive {
+                s1.to_lowercase() == s2.to_lowercase()
+            } else {
+                s1 == s2
+            }
+        }
         (Value::Bool(b1), Value::Bool(b2)) => b1 == b2,
         (Value::Null, Value::Null) => true,
         // Exact integer equality when both can be represented as U256

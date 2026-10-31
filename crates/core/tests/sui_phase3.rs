@@ -149,6 +149,33 @@ fn from_json_sui_bad_address_fails_closed() {
 }
 
 #[test]
+fn from_json_sui_out_of_range_int_rejected_not_truncated() {
+    // A u8 pure input with value 300 must fail the parse, not silently
+    // truncate to 44 (regression: range-check against the declared width).
+    let v = serde_json::json!({
+        "chain": "sui", "chainId": "mainnet", "from": SENDER,
+        "inputs": [{ "kind": "pure", "valueType": "u8", "value": "300" }],
+        "commands": [{ "SplitCoins": { "coin": {"GasCoin": true}, "amounts": [{"Input": 0}] } }]
+    });
+    let err = SuiTx::from_json(&v).unwrap_err();
+    assert!(err.contains("out of range"), "{err}");
+    // Same for a vector element.
+    let v = serde_json::json!({
+        "chain": "sui", "chainId": "mainnet", "from": SENDER,
+        "inputs": [{ "kind": "pure", "valueType": "vector<u16>", "value": [1, 70000] }],
+        "commands": [{ "SplitCoins": { "coin": {"GasCoin": true}, "amounts": [{"Input": 0}] } }]
+    });
+    assert!(SuiTx::from_json(&v).is_err());
+    // In-range values still parse.
+    let v = serde_json::json!({
+        "chain": "sui", "chainId": "mainnet", "from": SENDER,
+        "inputs": [{ "kind": "pure", "valueType": "u8", "value": "255" }],
+        "commands": [{ "SplitCoins": { "coin": {"GasCoin": true}, "amounts": [{"Input": 0}] } }]
+    });
+    assert!(SuiTx::from_json(&v).is_ok());
+}
+
+#[test]
 fn from_json_sui_empty_commands_rejected() {
     let v = serde_json::json!({
         "chain": "sui", "chainId": "mainnet", "from": SENDER,

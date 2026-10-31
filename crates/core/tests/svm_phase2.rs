@@ -220,6 +220,51 @@ async fn native_transfer_allowed_by_policy() {
     );
 }
 
+/// base58 is case-sensitive: a case variant of an allowlisted address is a
+/// DIFFERENT pubkey and must not match the rule (regression test — string
+/// equality on SVM contexts compares verbatim, not lowercased).
+#[tokio::test]
+async fn svm_string_eq_is_case_sensitive() {
+    let checker = Checker::new(reqwest::Client::new(), Vec::new(), strict());
+    // A case-swapped rendering of DEST — not the same pubkey.
+    let dest_case_variant = "2yeKnh4vA5Tih3k7mF4kBpSCnEecpgbHUF7AohQo9LYB"
+        .replace('K', "k")
+        .replace('B', "b");
+    assert_ne!(dest_case_variant, DEST);
+    let tx = svm_tx(serde_json::json!([{
+        "programId": SYSTEM, "accounts": [PAYER, dest_case_variant], "data": "3Bxs4Bc3VYuGVB19"
+    }]));
+    let resolver = resolver_with(
+        (ChainRef::Svm("mainnet-beta".into()), SYSTEM),
+        "0x02000000",
+        rule_entry(
+            Some(serde_json::json!({
+                "name": "0x02000000",
+                "args": [{"name": "lamports", "type": "u64"}]
+            })),
+            "accounts[1] == vars.recipient and args.lamports <= vars.max",
+            serde_json::json!({"recipient": DEST, "max": "1000000"}),
+        ),
+    );
+    let result = check(&checker, &tx, &resolver).await;
+    assert!(
+        matches!(result, CheckResult::Denied(_)),
+        "case-variant base58 address must not match the allowlisted one: {}",
+        result_code(&result)
+    );
+
+    // The exact address still passes.
+    let tx = svm_tx(serde_json::json!([{
+        "programId": SYSTEM, "accounts": [PAYER, DEST], "data": "3Bxs4Bc3VYuGVB19"
+    }]));
+    let result = check(&checker, &tx, &resolver).await;
+    assert!(
+        matches!(result, CheckResult::Ok),
+        "{}",
+        result_code(&result)
+    );
+}
+
 #[tokio::test]
 async fn native_transfer_rule_gates_amount_and_recipient() {
     let checker = Checker::new(reqwest::Client::new(), Vec::new(), strict());
