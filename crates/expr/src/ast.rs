@@ -18,6 +18,13 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// Membership in a runtime list value: `x in vars.wallets`. The source
+    /// expression must evaluate to a JSON array at run time.
+    InSource {
+        val: Box<Expr>,
+        source: Box<Expr>,
+        negated: bool,
+    },
     // Arithmetic
     Arith {
         op: ArithOp,
@@ -68,7 +75,7 @@ impl Expr {
             Expr::Or(..) => 1,
             Expr::And(..) => 2,
             Expr::Not(..) => 3,
-            Expr::BinOp { .. } | Expr::In { .. } => 4,
+            Expr::BinOp { .. } | Expr::In { .. } | Expr::InSource { .. } => 4,
             Expr::Arith { op, .. } => match op {
                 ArithOp::Shl | ArithOp::Shr => 5,
                 ArithOp::Add | ArithOp::Sub => 6,
@@ -100,6 +107,14 @@ impl Expr {
                 let kw = if *negated { "not in" } else { "in" };
                 let items: Vec<String> = list.iter().map(|e| e.render_prec(9)).collect();
                 format!("{} {kw} [{}]", val.render_prec(5), items.join(", "))
+            }
+            Expr::InSource {
+                val,
+                source,
+                negated,
+            } => {
+                let kw = if *negated { "not in" } else { "in" };
+                format!("{} {kw} {}", val.render_prec(5), source.render_prec(5))
             }
             Expr::Arith { op, lhs, rhs } => {
                 let s = match op {

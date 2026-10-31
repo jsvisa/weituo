@@ -18,7 +18,9 @@ and_expr = { not_expr  ~ (kw_and ~ not_expr)* }
 not_expr = { kw_not ~ not_expr | cmp_expr }
 
 // ── Comparisons & membership ──────────────────────────────────────────────────
-cmp_expr = { shift_expr ~ (in_op ~ array_lit | cmp_op ~ shift_expr)? }
+// `in` accepts an array literal (`x in ['a','b']`) or any list-valued
+// expression (`x in vars.wallets`).
+cmp_expr = { shift_expr ~ (in_op ~ (array_lit | shift_expr) | cmp_op ~ shift_expr)? }
 
 cmp_op = { "==" | "!=" | "<=" | ">=" | "<" | ">" | "=~" }
 in_op  = { kw_not ~ kw_in | kw_in }

@@ -9,7 +9,7 @@ missing_const_for_fn = "warn"
 collapsible_if = "warn"
 
 [workspace.package]
-version = "0.2.5"
+version = "0.3.0"
 license = "MIT"
 repository = "https://github.com/jsvisa/weituo"
 authors = ["weituo team"]

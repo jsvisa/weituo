@@ -6,6 +6,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::builtins::Builtins;
+use crate::chain::{ChainRef, ChainResolver, ChainTx, CompatResolver};
 use crate::decoder::{build_decoder, decode_args_only, decode_calldata};
 use crate::policy::{Policy, TokenOpPolicy};
 use crate::provider::RuleResolver;
@@ -155,19 +156,125 @@ impl DenyReason {
     }
 }
 
+/// EvalContext for one SVM instruction (design §6): chain_id/value stay 0,
+/// native amounts live in `args`, per-instruction synthetic data lives in
+/// `chain_fields`. Addresses are base58 — compared verbatim, never
+/// lowercased.
+#[cfg(feature = "svm")]
+fn svm_eval_ctx(
+    tx: &crate::svm::SvmTx,
+    ins: &crate::svm::SvmInstruction,
+    idx: usize,
+    num_instructions: usize,
+    network: String,
+    args: HashMap<String, serde_json::Value>,
+) -> EvalContext {
+    use alloy_primitives::U256;
+    let mut chain_fields = HashMap::new();
+    chain_fields.insert("accounts".to_string(), serde_json::json!(ins.accounts));
+    chain_fields.insert("signers".to_string(), serde_json::json!(tx.signers));
+    chain_fields.insert("instruction_index".to_string(), serde_json::json!(idx));
+    chain_fields.insert(
+        "num_instructions".to_string(),
+        serde_json::json!(num_instructions),
+    );
+    EvalContext {
+        chain_id: 0,
+        value: U256::ZERO,
+        args,
+        from_address: tx.from.clone(),
+        to_address: ins.program_id.clone(),
+        gas_price: 0,
+        gas_limit: 0,
+        vars: HashMap::new(),
+        network,
+        chain_fields,
+        // base58 is case-sensitive: case variants are different pubkeys,
+        // so string equality must compare verbatim.
+        case_insensitive_str_eq: false,
+    }
+}
+
+/// EvalContext for one Sui command (design §6): chain_id/value stay 0,
+/// native amounts live in `args`, per-command synthetic data lives in
+/// `chain_fields`. Addresses are full 64-nibble lowercase hex.
+#[cfg(feature = "sui")]
+#[allow(clippy::too_many_arguments)]
+fn sui_eval_ctx(
+    tx: &crate::sui::SuiTx,
+    to_address: String,
+    command_kind: &str,
+    idx: usize,
+    num_commands: usize,
+    type_arguments: &[String],
+    network: String,
+    args: HashMap<String, serde_json::Value>,
+) -> EvalContext {
+    use alloy_primitives::U256;
+    let mut chain_fields = HashMap::new();
+    chain_fields.insert("command_index".to_string(), serde_json::json!(idx));
+    chain_fields.insert("num_commands".to_string(), serde_json::json!(num_commands));
+    chain_fields.insert("command_kind".to_string(), serde_json::json!(command_kind));
+    chain_fields.insert("gas_budget".to_string(), serde_json::json!(tx.gas_budget));
+    chain_fields.insert("gas_price".to_string(), serde_json::json!(tx.gas_price));
+    chain_fields.insert(
+        "type_arguments".to_string(),
+        serde_json::json!(type_arguments),
+    );
+    EvalContext {
+        chain_id: 0,
+        value: U256::ZERO,
+        args,
+        from_address: tx.from.clone(),
+        to_address,
+        gas_price: 0,
+        gas_limit: 0,
+        vars: HashMap::new(),
+        network,
+        chain_fields,
+        // Hex addresses are case-insensitive; both sides are already
+        // normalized to full lowercase hex at parse time.
+        case_insensitive_str_eq: true,
+    }
+}
+
 /// Factory producing the `$`-builtin provider for one check. Receives the
 /// RPC URL resolved for the transaction's chain (`None` = unknown).
 pub type BuiltinsFactory =
     Arc<dyn Fn(Option<String>) -> Arc<dyn weituo_expr::context::BuiltinProvider> + Send + Sync>;
 
+/// EvalContext construction for the EVM pipeline: family network string
+/// threaded through so rules can reference `network` (and, on non-EVM
+/// families later, `chain_fields`).
+fn evm_eval_ctx(
+    tx: &Transaction,
+    args: HashMap<String, serde_json::Value>,
+    to_address: &str,
+    vars: HashMap<String, serde_json::Value>,
+) -> EvalContext {
+    EvalContext {
+        chain_id: tx.chain_id,
+        value: tx.value,
+        args,
+        from_address: tx.from.to_lowercase(),
+        to_address: to_address.to_lowercase(),
+        gas_price: tx.gas_price,
+        gas_limit: tx.gas_limit,
+        vars,
+        network: format!("eip155:{}", tx.chain_id),
+        chain_fields: HashMap::new(),
+        case_insensitive_str_eq: true,
+    }
+}
+
 /// The decision engine. Holds only immutable parameters — construct it once
 /// and call [`Checker::check`] with a [`RuleResolver`] per transaction.
 fn lookup_rules(rules: &HashMap<String, RuleEntry>, selector: &str) -> RuleLookup {
     if let Some(e) = rules.get(selector) {
-        return RuleLookup::Found(e.clone());
+        return RuleLookup::Found(Box::new(e.clone()));
     }
     if let Some(e) = rules.get("*") {
-        return RuleLookup::Found(e.clone());
+        return RuleLookup::Found(Box::new(e.clone()));
     }
     if rules.is_empty() {
         RuleLookup::NoContract
@@ -188,7 +295,7 @@ pub struct Checker {
 
 /// Result of a rule lookup in a contract's rule map.
 enum RuleLookup {
-    Found(RuleEntry),
+    Found(Box<RuleEntry>),
     NoSelector,
     NoContract,
 }
@@ -196,7 +303,7 @@ enum RuleLookup {
 /// Per-check context threaded through the pipeline: where rules come from
 /// and which `$`-builtin provider answers this check's expressions.
 struct CheckCtx<'a> {
-    resolver: &'a dyn RuleResolver,
+    resolver: &'a dyn ChainResolver,
     builtins: &'a Arc<dyn weituo_expr::context::BuiltinProvider>,
 }
 
@@ -221,8 +328,20 @@ impl Checker {
         Self {
             http,
             builtins_factory: None,
-            allowlist: allowlist.into_iter().map(|s| s.to_lowercase()).collect(),
+            // Stored verbatim: EVM comparisons are case-insensitive (hex),
+            // SVM base58 is case-sensitive — each family matches its way.
+            allowlist,
             policy,
+        }
+    }
+
+    /// Sender-allowlist match. EVM addresses are hex (case-insensitive);
+    /// SVM base58 and Sui (normalized at parse) compare verbatim.
+    fn allowlisted(&self, from: &str, case_insensitive: bool) -> bool {
+        if case_insensitive {
+            self.allowlist.iter().any(|a| a.eq_ignore_ascii_case(from))
+        } else {
+            self.allowlist.iter().any(|a| a == from)
         }
     }
 
@@ -237,26 +356,59 @@ impl Checker {
     /// Build the `$`-builtin provider for one check call.
     fn builtins_for(
         &self,
-        resolver: &dyn RuleResolver,
-        chain_id: u64,
+        resolver: &dyn ChainResolver,
+        chain: ChainRef,
     ) -> Arc<dyn weituo_expr::context::BuiltinProvider> {
-        self.builtins_for_opt(Some(resolver), chain_id)
+        self.builtins_for_opt(Some(resolver), chain)
     }
 
     fn builtins_for_opt(
         &self,
-        resolver: Option<&dyn RuleResolver>,
-        chain_id: u64,
+        resolver: Option<&dyn ChainResolver>,
+        chain: ChainRef,
     ) -> Arc<dyn weituo_expr::context::BuiltinProvider> {
-        let rpc_url = resolver.and_then(|r| r.chain_rpc_url(chain_id));
+        let rpc_url = resolver.and_then(|r| r.chain_rpc_url(chain));
         match &self.builtins_factory {
             Some(factory) => factory(rpc_url),
             None => Arc::new(Builtins::new(self.http.clone(), rpc_url)),
         }
     }
 
+    /// Unchanged EVM entry point — delegates to [`Checker::check_tx`] with
+    /// the caller's resolver wrapped in [`CompatResolver`] (embedders never
+    /// see the adapter).
     pub async fn check(&self, tx: &Transaction, resolver: &dyn RuleResolver) -> CheckResult {
-        let builtins = self.builtins_for(resolver, tx.chain_id);
+        self.check_tx(&ChainTx::Evm(tx.clone()), &CompatResolver(resolver))
+            .await
+    }
+
+    /// Unified entry point: policy gates → per-call rule lookup → eval.
+    pub async fn check_tx(&self, tx: &ChainTx, resolver: &dyn ChainResolver) -> CheckResult {
+        match tx {
+            ChainTx::Evm(tx) => {
+                self.check_evm(tx, ChainRef::Evm(tx.chain_id), resolver)
+                    .await
+            }
+            #[cfg(feature = "svm")]
+            ChainTx::Svm(tx) => {
+                self.check_svm(tx, ChainRef::Svm(tx.network.clone()), resolver)
+                    .await
+            }
+            #[cfg(feature = "sui")]
+            ChainTx::Sui(tx) => {
+                self.check_sui(tx, ChainRef::Sui(tx.network.clone()), resolver)
+                    .await
+            }
+        }
+    }
+
+    async fn check_evm(
+        &self,
+        tx: &Transaction,
+        chain: ChainRef,
+        resolver: &dyn ChainResolver,
+    ) -> CheckResult {
+        let builtins = self.builtins_for(resolver, chain);
         let ctx = CheckCtx {
             resolver,
             builtins: &builtins,
@@ -292,6 +444,597 @@ impl Checker {
         CheckResult::Ok
     }
 
+    /// SVM pipeline (design §4/§9): one call per instruction — a transaction
+    /// *is* a multicall. Gate order per instruction: native-transfer gate →
+    /// rule lookup → token-op gate (only when lookup fails) → eval. The
+    /// allowlist bypass applies to the fee payer before any instruction is
+    /// inspected. SVM has no creation gate or EIP-2718 type gate.
+    #[cfg(feature = "svm")]
+    async fn check_svm(
+        &self,
+        tx: &crate::svm::SvmTx,
+        chain: ChainRef,
+        resolver: &dyn ChainResolver,
+    ) -> CheckResult {
+        use crate::svm::{
+            is_spl_token_program, is_system_transfer, spl_token_op_tag, svm_selector_candidates,
+        };
+
+        if self.allowlisted(&tx.from, false) {
+            return CheckResult::Ok;
+        }
+
+        let builtins = self.builtins_for(resolver, chain.clone());
+        let num_instructions = tx.instructions.len();
+        for (idx, ins) in tx.instructions.iter().enumerate() {
+            let display_addr = format!("{} (instruction[{idx}])", ins.program_id);
+
+            // Native-transfer gate: ALL System::Transfer instructions when
+            // policy allows (design §9). Otherwise they fall through to rule
+            // lookup like any other instruction.
+            if ins.program_id == crate::svm::SYSTEM_PROGRAM
+                && is_system_transfer(&ins.data)
+                && self.policy.allow_native_transfer
+            {
+                continue;
+            }
+
+            // Rule lookup (design §9): candidates longest-first, then `*`.
+            // On any failure the token-op gate runs BEFORE the failure is
+            // surfaced — same ordering as the EVM pipeline's
+            // `step_rule_lookup → step_token_op` fallback.
+            let candidates = svm_selector_candidates(&ins.data);
+            let miss: Option<DenyReason> = match &resolver
+                .contract_rules(chain.clone(), &ins.program_id)
+                .await
+            {
+                Some(rules) => {
+                    let mut found: Option<(String, crate::types::RuleEntry)> = None;
+                    for sel in &candidates {
+                        if let Some(entry) = rules.get(sel) {
+                            found = Some((sel.clone(), entry.clone()));
+                            break;
+                        }
+                    }
+                    match found.or_else(|| rules.get("*").map(|e| ("*".to_string(), e.clone()))) {
+                        Some((selector, entry)) => {
+                            if let Err(reason) = self
+                                .svm_eval_instruction(
+                                    tx,
+                                    ins,
+                                    idx,
+                                    num_instructions,
+                                    &chain,
+                                    selector,
+                                    entry,
+                                    &builtins,
+                                )
+                                .await
+                            {
+                                return CheckResult::Denied(reason);
+                            }
+                            continue;
+                        }
+                        None if rules.is_empty() => Some(DenyReason::NoContract {
+                            address: display_addr,
+                            chain_id: 0,
+                        }),
+                        None => Some(DenyReason::NoRule {
+                            address: display_addr,
+                            selector: candidates
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "0x".to_string()),
+                        }),
+                    }
+                }
+                None => Some(DenyReason::NoContract {
+                    address: display_addr,
+                    chain_id: 0,
+                }),
+            };
+            let Some(reason) = miss else {
+                continue; // instruction passed via its rule
+            };
+            // Token-op gate — only when rule lookup failed (design §9).
+            if is_spl_token_program(&ins.program_id) {
+                if let Some(tag) = spl_token_op_tag(&ins.data) {
+                    match self.policy.token_op_policy {
+                        TokenOpPolicy::AllowAll => continue,
+                        TokenOpPolicy::DenyAll => {
+                            return CheckResult::Denied(DenyReason::TokenOpDenied {
+                                selector: format!("0x{tag:02x}"),
+                            });
+                        }
+                        // Whitelist/RequireRule fall through to the lookup
+                        // failure (a missing rule then denies with it).
+                        TokenOpPolicy::Whitelist | TokenOpPolicy::RequireRule => {}
+                    }
+                }
+            }
+            return CheckResult::Denied(reason);
+        }
+        CheckResult::Ok
+    }
+
+    /// Evaluate one SVM instruction's rule clauses (shared by `check_svm`).
+    /// Returns `Ok(())` when a clause passed; `Err(reason)` carries the
+    /// denial (eval error or expression denied) with the instruction index
+    /// baked into the message.
+    #[cfg(feature = "svm")]
+    #[allow(clippy::too_many_arguments)]
+    async fn svm_eval_instruction(
+        &self,
+        tx: &crate::svm::SvmTx,
+        ins: &crate::svm::SvmInstruction,
+        idx: usize,
+        num_instructions: usize,
+        chain: &ChainRef,
+        selector: String,
+        entry: crate::types::RuleEntry,
+        builtins: &Arc<dyn weituo_expr::context::BuiltinProvider>,
+    ) -> Result<(), DenyReason> {
+        // Decode args with the rule's Anchor IDL fragment. Decode failures
+        // fail closed: args stay empty and any expression referencing them
+        // errors (deny).
+        let args = match &entry.family_abi {
+            Some(abi @ crate::types::FamilyAbi::Svm { .. }) => {
+                crate::svm::decode_svm_args(abi, &selector, &ins.data).unwrap_or_default()
+            }
+            _ => Default::default(),
+        };
+
+        let ctx = svm_eval_ctx(
+            tx,
+            ins,
+            idx,
+            num_instructions,
+            chain.to_family_network(),
+            args,
+        );
+
+        self.eval_rule_clauses(&entry, ctx, &format!("instruction[{idx}] "), builtins)
+            .await
+    }
+
+    /// Evaluate a rule entry's clauses against a prepared context — the
+    /// shared tail of every family's per-call pipeline. `where_` prefixes
+    /// denial messages with the call's index (`instruction[i]`/`command[i]`).
+    /// Only the SVM/Sui per-call paths use it (EVM evaluates clauses
+    /// inline), so it is compiled under those features only.
+    #[cfg(any(feature = "svm", feature = "sui"))]
+    async fn eval_rule_clauses(
+        &self,
+        entry: &crate::types::RuleEntry,
+        base_ctx: EvalContext,
+        where_: &str,
+        builtins: &Arc<dyn weituo_expr::context::BuiltinProvider>,
+    ) -> Result<(), DenyReason> {
+        let mut any_passed = false;
+        let mut last_denied = String::new();
+        let mut last_failing = None;
+        'clauses: for clause in &entry.clauses {
+            let mut ctx = base_ctx.clone();
+            ctx.vars = clause.vars.clone();
+            for expr_str in clause.expr.exprs() {
+                match expr::evaluate_explain(expr_str, &ctx, Arc::clone(builtins)).await {
+                    Ok((true, _)) => {}
+                    Ok((false, explain)) => {
+                        last_denied = format!("{where_}{expr_str}");
+                        last_failing = explain;
+                        continue 'clauses;
+                    }
+                    Err(e) => {
+                        return Err(DenyReason::EvalError(format!("{where_}{e}")));
+                    }
+                }
+            }
+            any_passed = true;
+            break;
+        }
+        if !any_passed {
+            return Err(DenyReason::ExpressionDenied {
+                expr: last_denied,
+                explain: last_failing,
+            });
+        }
+        Ok(())
+    }
+
+    /// `waf_testRule` for SVM: evaluate the caller-supplied expr against every
+    /// instruction using the inline ABI (`SvmTx.abi`). No policy gates — the
+    /// EVM test path skips them the same way.
+    #[cfg(feature = "svm")]
+    async fn test_svm(
+        &self,
+        tx: &crate::svm::SvmTx,
+        resolver: Option<&dyn ChainResolver>,
+    ) -> CheckResult {
+        let expr_str = match &tx.expr {
+            Some(e) => e.clone(),
+            None => return CheckResult::Denied(DenyReason::NoExprInTest),
+        };
+        let builtins = self.builtins_for_opt(resolver, ChainRef::Svm(tx.network.clone()));
+        let num_instructions = tx.instructions.len();
+        for (idx, ins) in tx.instructions.iter().enumerate() {
+            let args = match &tx.abi {
+                Some(abi) => {
+                    let selector = crate::svm::func_selector_from_abi_name(abi);
+                    crate::svm::decode_svm_args(abi, &selector, &ins.data).unwrap_or_default()
+                }
+                None => Default::default(),
+            };
+            let mut ctx = svm_eval_ctx(
+                tx,
+                ins,
+                idx,
+                num_instructions,
+                ChainRef::Svm(tx.network.clone()).to_family_network(),
+                args,
+            );
+            ctx.vars = tx.vars.clone().unwrap_or_default();
+            match expr::evaluate_explain(&expr_str, &ctx, Arc::clone(&builtins)).await {
+                Ok((true, _)) => {}
+                Ok((false, explain)) => {
+                    return CheckResult::Denied(DenyReason::ExpressionDenied {
+                        expr: format!("instruction[{idx}] {expr_str}"),
+                        explain,
+                    });
+                }
+                Err(e) => {
+                    return CheckResult::Denied(DenyReason::EvalError(format!(
+                        "instruction[{idx}]: {e}"
+                    )));
+                }
+            }
+        }
+        CheckResult::Ok
+    }
+
+    /// Sui pipeline (design §4/§8.3/§9): the PTB's commands normalize to one
+    /// call per command — native-transfer pairs (§8.3) become synthetic
+    /// calls under the system package with selector `native_transfer`,
+    /// MoveCalls check against their `module::function` rule, and every
+    /// other command fails closed through the policy layer. Denial messages
+    /// carry the command index (`command[1] …`).
+    #[cfg(feature = "sui")]
+    async fn check_sui(
+        &self,
+        tx: &crate::sui::SuiTx,
+        chain: ChainRef,
+        resolver: &dyn ChainResolver,
+    ) -> CheckResult {
+        use crate::sui::tx::{sui_pure_u64, sui_pure_vector, sui_recipient};
+        use crate::sui::{SuiArgument, SuiCommand};
+        use std::collections::HashMap;
+
+        if self.allowlisted(&tx.from, false) {
+            return CheckResult::Ok;
+        }
+
+        let builtins = self.builtins_for(resolver, chain.clone());
+        let network = chain.to_family_network();
+        let num_commands = tx.commands.len();
+
+        // ── Native-transfer dataflow pass (§8.3) ──────────────────────────
+        // Recognized transfers are consumed here and checked as synthetic
+        // `native_transfer` calls; everything else takes the per-command
+        // path (inter-command `Result` references fail closed, §8.2).
+        let mut consumed = vec![false; num_commands];
+        // first-command index → (amount, recipient, kind, type_arguments)
+        let mut synthetic: HashMap<usize, (String, String, &'static str, Vec<String>)> =
+            HashMap::new();
+
+        for i in 0..num_commands {
+            match &tx.commands[i] {
+                SuiCommand::SplitCoins { coin, amounts } => {
+                    // SplitCoins(GasCoin, [Input(a)]) → later
+                    // TransferObjects([Result(i)], Input(r))
+                    let (SuiArgument::GasCoin, [SuiArgument::Input(a)]) =
+                        (coin, amounts.as_slice())
+                    else {
+                        continue;
+                    };
+                    let Some(j) = (i + 1..num_commands).find(|&j| {
+                        matches!(
+                            &tx.commands[j],
+                            SuiCommand::TransferObjects {
+                                objects,
+                                address: SuiArgument::Input(_),
+                                ..
+                            } if matches!(objects.as_slice(), [SuiArgument::Result(n)] if *n == i)
+                        )
+                    }) else {
+                        continue;
+                    };
+                    let (Some(amount), Some(recipient)) = (
+                        sui_pure_u64(&tx.inputs, *a),
+                        sui_recipient(&tx.inputs, &tx.commands[j]),
+                    ) else {
+                        continue;
+                    };
+                    // The TransferObjects is consumed; the SplitCoins slot
+                    // becomes the synthetic native_transfer call.
+                    consumed[j] = true;
+                    synthetic.insert(i, (amount, recipient, "SplitCoins", Vec::new()));
+                }
+                SuiCommand::MoveCall(mc)
+                    if mc.package == crate::sui::SYSTEM_PACKAGE
+                        && mc.module_func() == "pay::pay_sui" =>
+                {
+                    // pay_sui(amounts: vector<u64>, recipients:
+                    // vector<address>) — v1 recognizes the single-transfer
+                    // form; multi-pair calls take the normal rule path.
+                    let [SuiArgument::Input(a), SuiArgument::Input(r)] = mc.arguments.as_slice()
+                    else {
+                        continue;
+                    };
+                    let (Some(amounts), Some(recipients)) = (
+                        sui_pure_vector(&tx.inputs, *a, "u64"),
+                        sui_pure_vector(&tx.inputs, *r, "address"),
+                    ) else {
+                        continue;
+                    };
+                    if amounts.len() == 1 && recipients.len() == 1 {
+                        consumed[i] = true;
+                        synthetic.insert(
+                            i,
+                            (
+                                amounts[0].clone(),
+                                recipients[0].clone(),
+                                "MoveCall",
+                                mc.type_arguments.clone(),
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ── Per-command checks, in command order ──────────────────────────
+        for i in 0..num_commands {
+            // A synthetic native transfer occupies its first command's slot.
+            if let Some((amount, recipient, kind, type_args)) = synthetic.get(&i) {
+                let mut args = HashMap::new();
+                args.insert("amount".to_string(), serde_json::json!(amount));
+                args.insert("recipient".to_string(), serde_json::json!(recipient));
+
+                // Native-transfer gate: allowed unless policy says otherwise.
+                if self.policy.allow_native_transfer {
+                    continue;
+                }
+                // Rule path under the system package (§5: recipient
+                // allowlists work exactly like EVM receive() rules).
+                let display_addr = format!("{} (command[{i}])", crate::sui::SYSTEM_PACKAGE);
+                let rules = match resolver
+                    .contract_rules(chain.clone(), crate::sui::SYSTEM_PACKAGE)
+                    .await
+                {
+                    Some(rules) if !rules.is_empty() => rules,
+                    _ => {
+                        return CheckResult::Denied(DenyReason::NoContract {
+                            address: display_addr,
+                            chain_id: 0,
+                        });
+                    }
+                };
+                let entry = match rules.get("native_transfer").or_else(|| rules.get("*")) {
+                    Some(entry) => entry.clone(),
+                    None => {
+                        return CheckResult::Denied(DenyReason::NoRule {
+                            address: display_addr,
+                            selector: "native_transfer".to_string(),
+                        });
+                    }
+                };
+                let ctx = sui_eval_ctx(
+                    tx,
+                    crate::sui::SYSTEM_PACKAGE.to_string(),
+                    kind,
+                    i,
+                    num_commands,
+                    type_args,
+                    network.clone(),
+                    args,
+                );
+                if let Err(reason) = self
+                    .eval_rule_clauses(&entry, ctx, &format!("command[{i}] "), &builtins)
+                    .await
+                {
+                    return CheckResult::Denied(reason);
+                }
+                continue;
+            }
+
+            if consumed[i] {
+                continue; // paired TransferObjects, already checked
+            }
+
+            match &tx.commands[i] {
+                SuiCommand::MoveCall(mc) => {
+                    let display_addr = format!("{} (command[{i}])", mc.package);
+                    let rules = match resolver.contract_rules(chain.clone(), &mc.package).await {
+                        Some(rules) if !rules.is_empty() => rules,
+                        _ => {
+                            // Token-op gate — only when rule lookup failed
+                            // (design §9). Same targets over the gas coin are
+                            // already consumed by the native-transfer pass.
+                            if mc.package == crate::sui::SYSTEM_PACKAGE
+                                && crate::sui::is_token_op_target(&mc.module_func())
+                            {
+                                match self.policy.token_op_policy {
+                                    TokenOpPolicy::AllowAll => continue,
+                                    TokenOpPolicy::DenyAll => {
+                                        return CheckResult::Denied(DenyReason::TokenOpDenied {
+                                            selector: mc.selector(),
+                                        });
+                                    }
+                                    TokenOpPolicy::Whitelist | TokenOpPolicy::RequireRule => {}
+                                }
+                            }
+                            return CheckResult::Denied(DenyReason::NoContract {
+                                address: display_addr,
+                                chain_id: 0,
+                            });
+                        }
+                    };
+                    let selector = mc.selector();
+                    let entry = match crate::checker::lookup_rules(&rules, &selector) {
+                        RuleLookup::Found(entry) => entry,
+                        RuleLookup::NoContract => {
+                            if mc.package == crate::sui::SYSTEM_PACKAGE
+                                && crate::sui::is_token_op_target(&mc.module_func())
+                            {
+                                match self.policy.token_op_policy {
+                                    TokenOpPolicy::AllowAll => continue,
+                                    TokenOpPolicy::DenyAll => {
+                                        return CheckResult::Denied(DenyReason::TokenOpDenied {
+                                            selector: mc.selector(),
+                                        });
+                                    }
+                                    TokenOpPolicy::Whitelist | TokenOpPolicy::RequireRule => {}
+                                }
+                            }
+                            return CheckResult::Denied(DenyReason::NoContract {
+                                address: display_addr,
+                                chain_id: 0,
+                            });
+                        }
+                        RuleLookup::NoSelector => {
+                            if mc.package == crate::sui::SYSTEM_PACKAGE
+                                && crate::sui::is_token_op_target(&mc.module_func())
+                            {
+                                match self.policy.token_op_policy {
+                                    TokenOpPolicy::AllowAll => continue,
+                                    TokenOpPolicy::DenyAll => {
+                                        return CheckResult::Denied(DenyReason::TokenOpDenied {
+                                            selector: mc.selector(),
+                                        });
+                                    }
+                                    TokenOpPolicy::Whitelist | TokenOpPolicy::RequireRule => {}
+                                }
+                            }
+                            return CheckResult::Denied(DenyReason::NoRule {
+                                address: display_addr,
+                                selector,
+                            });
+                        }
+                    };
+
+                    // Decode args with the rule's Move signature. Decode
+                    // failures fail closed: args stay empty and any
+                    // expression referencing them errors (deny).
+                    let args = match &entry.family_abi {
+                        Some(abi @ crate::types::FamilyAbi::Sui { .. }) => {
+                            crate::sui::decode_sui_args_typed(abi, &mc.arguments, &tx.inputs)
+                                .unwrap_or_default()
+                        }
+                        _ => Default::default(),
+                    };
+                    let ctx = sui_eval_ctx(
+                        tx,
+                        mc.package.clone(),
+                        "MoveCall",
+                        i,
+                        num_commands,
+                        &mc.type_arguments,
+                        network.clone(),
+                        args,
+                    );
+                    if let Err(reason) = self
+                        .eval_rule_clauses(&entry, ctx, &format!("command[{i}] "), &builtins)
+                        .await
+                    {
+                        return CheckResult::Denied(reason);
+                    }
+                }
+                // Creation gate: Publish/Upgrade mint or replace packages.
+                SuiCommand::Publish | SuiCommand::Upgrade => {
+                    if !self.policy.allow_contract_creation {
+                        return CheckResult::Denied(DenyReason::ContractCreationDenied);
+                    }
+                    // Creation allowed — but a non-MoveCall command has no
+                    // rule context. Fail closed.
+                    return CheckResult::Denied(DenyReason::NoContract {
+                        address: format!("{} (command[{i}])", tx.commands[i].kind()),
+                        chain_id: 0,
+                    });
+                }
+                // SplitCoins/MergeCoins/TransferObjects/MakeMoveVec outside
+                // the recognized native-transfer pattern: fail closed.
+                other => {
+                    return CheckResult::Denied(DenyReason::NoContract {
+                        address: format!("{} (command[{i}])", other.kind()),
+                        chain_id: 0,
+                    });
+                }
+            }
+        }
+        CheckResult::Ok
+    }
+
+    /// `waf_testRule` for Sui: evaluate the caller-supplied expr against
+    /// every command using the inline Move signature (`SuiTx.abi`).
+    /// MoveCall commands decode positionally; other commands evaluate with
+    /// empty args. No policy gates — the EVM test path skips them too.
+    #[cfg(feature = "sui")]
+    async fn test_sui(
+        &self,
+        tx: &crate::sui::SuiTx,
+        resolver: Option<&dyn ChainResolver>,
+    ) -> CheckResult {
+        use crate::sui::SuiCommand;
+
+        let expr_str = match &tx.expr {
+            Some(e) => e.clone(),
+            None => return CheckResult::Denied(DenyReason::NoExprInTest),
+        };
+        let builtins = self.builtins_for_opt(resolver, ChainRef::Sui(tx.network.clone()));
+        let num_commands = tx.commands.len();
+        for (idx, cmd) in tx.commands.iter().enumerate() {
+            let (to_address, type_args, args) = match cmd {
+                SuiCommand::MoveCall(mc) => {
+                    let args = match &tx.abi {
+                        Some(abi) => {
+                            crate::sui::decode_sui_args_typed(abi, &mc.arguments, &tx.inputs)
+                                .unwrap_or_default()
+                        }
+                        None => Default::default(),
+                    };
+                    (mc.package.clone(), mc.type_arguments.clone(), args)
+                }
+                _other => (String::new(), Vec::new(), Default::default()),
+            };
+            let mut ctx = sui_eval_ctx(
+                tx,
+                to_address,
+                cmd.kind(),
+                idx,
+                num_commands,
+                &type_args,
+                ChainRef::Sui(tx.network.clone()).to_family_network(),
+                args,
+            );
+            ctx.vars = tx.vars.clone().unwrap_or_default();
+            match expr::evaluate_explain(&expr_str, &ctx, Arc::clone(&builtins)).await {
+                Ok((true, _)) => {}
+                Ok((false, explain)) => {
+                    return CheckResult::Denied(DenyReason::ExpressionDenied {
+                        expr: format!("command[{idx}] {expr_str}"),
+                        explain,
+                    });
+                }
+                Err(e) => {
+                    return CheckResult::Denied(DenyReason::EvalError(format!(
+                        "command[{idx}]: {e}"
+                    )));
+                }
+            }
+        }
+        CheckResult::Ok
+    }
+
     fn step_transaction_type(&self, tx: &Transaction) -> Option<CheckResult> {
         let transaction_type = tx.transaction_type?;
         if self.policy.transaction_types.contains(&transaction_type) {
@@ -304,7 +1047,7 @@ impl Checker {
     }
 
     fn step_allowlist(&self, tx: &Transaction) -> Option<CheckResult> {
-        if self.allowlist.contains(&tx.from.to_lowercase()) {
+        if self.allowlisted(&tx.from, true) {
             Some(CheckResult::Ok)
         } else {
             None
@@ -366,16 +1109,19 @@ impl Checker {
         &self,
         tx: &Transaction,
         selector: &str,
-        resolver: &dyn RuleResolver,
+        resolver: &dyn ChainResolver,
     ) -> Result<RuleEntry, DenyReason> {
-        let Some(rules) = resolver.contract_rules(tx.chain_id, &tx.to).await else {
+        let Some(rules) = resolver
+            .contract_rules(ChainRef::Evm(tx.chain_id), &tx.to)
+            .await
+        else {
             return Err(DenyReason::NoContract {
                 address: tx.to.clone(),
                 chain_id: tx.chain_id,
             });
         };
         match lookup_rules(&rules, selector) {
-            RuleLookup::Found(e) => Ok(e),
+            RuleLookup::Found(e) => Ok(*e),
             RuleLookup::NoSelector => Err(DenyReason::NoRule {
                 address: tx.to.clone(),
                 selector: selector.to_string(),
@@ -411,16 +1157,7 @@ impl Checker {
         let mut last_denied = String::new();
         let mut last_failing = None;
         'clauses: for clause in &entry.clauses {
-            let ctx = EvalContext {
-                chain_id: tx.chain_id,
-                value: tx.value,
-                args: args.clone(),
-                from_address: tx.from.to_lowercase(),
-                to_address: tx.to.to_lowercase(),
-                gas_price: tx.gas_price,
-                gas_limit: tx.gas_limit,
-                vars: clause.vars.clone(),
-            };
+            let ctx = evm_eval_ctx(tx, args.clone(), &tx.to, clause.vars.clone());
             for expr_str in clause.expr.exprs() {
                 match expr::evaluate_explain(expr_str, &ctx, Arc::clone(cx.builtins)).await {
                     Ok((true, _)) => {}
@@ -686,14 +1423,18 @@ impl Checker {
         }
         let inner_target = inner.target;
         let inner_address = format!("{inner_target} (inner[{idx}])");
-        let Some(rules) = cx.resolver.contract_rules(tx.chain_id, inner_target).await else {
+        let Some(rules) = cx
+            .resolver
+            .contract_rules(ChainRef::Evm(tx.chain_id), inner_target)
+            .await
+        else {
             return Err(DenyReason::NoContract {
                 address: inner_address,
                 chain_id: tx.chain_id,
             });
         };
         let inner_entry = match lookup_rules(&rules, selector) {
-            RuleLookup::Found(e) => e,
+            RuleLookup::Found(e) => *e,
             RuleLookup::NoSelector => {
                 return Err(DenyReason::NoRule {
                     address: inner_address,
@@ -728,16 +1469,7 @@ impl Checker {
         let mut last_denied = String::new();
         let mut last_failing = None;
         'clauses: for clause in &inner_entry.clauses {
-            let inner_ctx = EvalContext {
-                chain_id: tx.chain_id,
-                value: tx.value,
-                args: inner_args.clone(),
-                from_address: tx.from.to_lowercase(),
-                to_address: inner_target.to_lowercase(),
-                gas_price: tx.gas_price,
-                gas_limit: tx.gas_limit,
-                vars: clause.vars.clone(),
-            };
+            let inner_ctx = evm_eval_ctx(tx, inner_args.clone(), inner_target, clause.vars.clone());
             for expr_str in clause.expr.exprs() {
                 match expr::evaluate_explain(expr_str, &inner_ctx, Arc::clone(cx.builtins)).await {
                     Ok((true, _)) => {}
@@ -772,6 +1504,10 @@ impl Checker {
         req: &TypedDataRequest,
         resolver: &dyn RuleResolver,
     ) -> CheckResult {
+        // EIP-712 is EVM-only; adapt the caller's resolver for the internal
+        // ChainResolver plumbing (same pattern as `check`).
+        let resolver = &CompatResolver(resolver);
+
         // 1. No verifyingContract (or zero address) → off-chain auth, skip WAF
         let contract = match req.domain.verifying_contract.as_deref() {
             Some(c) if !is_missing_or_zero_address(c) => c.to_lowercase(),
@@ -779,20 +1515,20 @@ impl Checker {
         };
 
         // 2. Sender allowlist bypass
-        if self.allowlist.contains(&req.from.to_lowercase()) {
+        if self.allowlisted(&req.from, true) {
             return CheckResult::Ok;
         }
 
         // 3. Rule lookup: "domain.name::primaryType" acts as the selector
         let domain_name = normalize_domain_name(&req.domain.name);
         let selector = format!("{}::{}", domain_name, req.primary_type);
-        let builtins = self.builtins_for(resolver, req.domain.chain_id);
+        let builtins = self.builtins_for(resolver, ChainRef::Evm(req.domain.chain_id));
         let ctx = CheckCtx {
             resolver,
             builtins: &builtins,
         };
         let entry = match resolver
-            .contract_rules(req.domain.chain_id, &contract)
+            .contract_rules(ChainRef::Evm(req.domain.chain_id), &contract)
             .await
             .map(|rules| lookup_rules(&rules, &selector))
         {
@@ -855,6 +1591,9 @@ impl Checker {
                 gas_price: 0,
                 gas_limit: 0,
                 vars: clause.vars.clone(),
+                network: format!("eip155:{}", req.domain.chain_id),
+                chain_fields: HashMap::new(),
+                case_insensitive_str_eq: true,
             };
             for expr_str in clause.expr.exprs() {
                 match expr::evaluate_explain(expr_str, &ctx, Arc::clone(cx.builtins)).await {
@@ -915,6 +1654,31 @@ impl Checker {
     /// When `abi` is omitted the engine falls back to the stored rule's ABI
     /// (via `resolver`) for calldata decoding.
     pub async fn test(&self, tx: &Transaction, resolver: Option<&dyn RuleResolver>) -> CheckResult {
+        let compat = resolver.map(CompatResolver);
+        self.test_tx(
+            &ChainTx::Evm(tx.clone()),
+            compat.as_ref().map(|c| c as &dyn ChainResolver),
+        )
+        .await
+    }
+
+    /// Unified test-mode preview (mirrors [`Checker::test`]): inline `abi` on
+    /// the transaction plays the role of `Transaction.abi` today.
+    pub async fn test_tx(&self, tx: &ChainTx, resolver: Option<&dyn ChainResolver>) -> CheckResult {
+        match tx {
+            ChainTx::Evm(tx) => self.test_evm(tx, resolver).await,
+            #[cfg(feature = "svm")]
+            ChainTx::Svm(tx) => self.test_svm(tx, resolver).await,
+            #[cfg(feature = "sui")]
+            ChainTx::Sui(tx) => self.test_sui(tx, resolver).await,
+        }
+    }
+
+    async fn test_evm(
+        &self,
+        tx: &Transaction,
+        resolver: Option<&dyn ChainResolver>,
+    ) -> CheckResult {
         if let Some(r) = self.step_transaction_type(tx) {
             return r;
         }
@@ -922,7 +1686,7 @@ impl Checker {
             Some(e) => e.clone(),
             None => return CheckResult::Denied(DenyReason::NoExprInTest),
         };
-        let builtins = self.builtins_for_opt(resolver, tx.chain_id);
+        let builtins = self.builtins_for_opt(resolver, ChainRef::Evm(tx.chain_id));
 
         let selector = if tx.data.len() >= 10 {
             tx.data[..10].to_lowercase()
@@ -938,7 +1702,7 @@ impl Checker {
         } else {
             let found = match resolver {
                 Some(r) => r
-                    .contract_rules(tx.chain_id, &tx.to)
+                    .contract_rules(ChainRef::Evm(tx.chain_id), &tx.to)
                     .await
                     .map(|rules| lookup_rules(&rules, &selector)),
                 None => None,
@@ -973,16 +1737,7 @@ impl Checker {
             Default::default()
         };
 
-        let ctx = EvalContext {
-            chain_id: tx.chain_id,
-            value: tx.value,
-            args,
-            from_address: tx.from.to_lowercase(),
-            to_address: tx.to.to_lowercase(),
-            gas_price: tx.gas_price,
-            gas_limit: tx.gas_limit,
-            vars,
-        };
+        let ctx = evm_eval_ctx(tx, args, &tx.to, vars);
 
         // Evaluate the outer expression first
         let (outer_ok, explain) =
@@ -1033,6 +1788,9 @@ impl Checker {
                         gas_price: ctx.gas_price,
                         gas_limit: ctx.gas_limit,
                         vars: ctx.vars.clone(),
+                        network: ctx.network.clone(),
+                        chain_fields: HashMap::new(),
+                        case_insensitive_str_eq: ctx.case_insensitive_str_eq,
                     };
 
                     match expr::evaluate_explain(&expr_str, &inner_ctx, Arc::clone(&builtins)).await
@@ -1288,6 +2046,7 @@ mod stateless_tests {
                 vars: HashMap::new(),
             }],
             abi_item: None,
+            family_abi: None,
             multicall: None,
             invalid_decoder: false,
         }
