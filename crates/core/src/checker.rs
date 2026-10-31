@@ -600,6 +600,9 @@ impl Checker {
     /// Evaluate a rule entry's clauses against a prepared context — the
     /// shared tail of every family's per-call pipeline. `where_` prefixes
     /// denial messages with the call's index (`instruction[i]`/`command[i]`).
+    /// Only the SVM/Sui per-call paths use it (EVM evaluates clauses
+    /// inline), so it is compiled under those features only.
+    #[cfg(any(feature = "svm", feature = "sui"))]
     async fn eval_rule_clauses(
         &self,
         entry: &crate::types::RuleEntry,
