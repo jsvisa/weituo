@@ -25,6 +25,25 @@ impl From<u64> for ChainRef {
     }
 }
 
+/// Normalize a Sui address to the full 64-nibble lowercase hex form
+/// (`0x2` → `0x000…0002`). Variable-length hex is the wire convention;
+/// comparisons and rule keys always use the full form. Fail-closed:
+/// anything that is not valid hex (with or without the `0x` prefix)
+/// decoding to ≤ 32 bytes is an error.
+pub fn normalize_sui_address(s: &str) -> Result<String, String> {
+    let hex_part = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .ok_or_else(|| format!("sui address '{s}' must be 0x-hex"))?;
+    if hex_part.is_empty()
+        || hex_part.len() > 64
+        || !hex_part.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(format!("invalid sui address '{s}'"));
+    }
+    Ok(format!("0x{:0>64}", hex_part.to_lowercase()))
+}
+
 impl ChainRef {
     /// CAIP-2-style rendering: `"eip155:1"` / `"svm:mainnet-beta"` /
     /// `"sui:mainnet"`.
@@ -39,10 +58,20 @@ impl ChainRef {
     /// Lowercase-normalization an address key needs for this family.
     /// EVM hex addresses are case-insensitive; SVM base58 addresses are
     /// case-sensitive; Sui hex is normalized to lowercase.
-    pub(crate) fn normalize_address(&self, address: &str) -> String {
+    /// Sender-allowlist / rule-key address normalization per family.
+    ///
+    /// EVM lowercases (hex is case-insensitive); SVM base58 is stored
+    /// verbatim (case-sensitive); Sui validates and expands to the full
+    /// 64-nibble lowercase hex (`0x2` → `0x000…0002`). Invalid Sui input
+    /// falls back to the lowercased raw string — the wire parser has already
+    /// validated it fail-closed by the time rules compare.
+    pub fn normalize_address(&self, address: &str) -> String {
         match self {
             Self::Svm(_) => address.to_string(),
-            _ => address.to_lowercase(),
+            Self::Sui(_) => {
+                normalize_sui_address(address).unwrap_or_else(|_| address.to_lowercase())
+            }
+            Self::Evm(_) => address.to_lowercase(),
         }
     }
 }
@@ -55,7 +84,9 @@ pub enum ChainTx {
     /// SVM transaction (feature `svm`) — resolved accounts, base58/hex data.
     #[cfg(feature = "svm")]
     Svm(crate::svm::SvmTx),
-    // Sui(SuiTx)   — phase 3 (feature `sui`)
+    /// Sui PTB (feature `sui`) — programmable transaction commands.
+    #[cfg(feature = "sui")]
+    Sui(crate::sui::SuiTx),
 }
 
 impl ChainTx {
@@ -85,10 +116,17 @@ impl ChainTx {
                         .to_string(),
                 )
             }
-            Some("sui") => Err(
-                "chain family 'sui' is not supported by this build (missing `sui` feature)"
-                    .to_string(),
-            ),
+            Some("sui") => {
+                #[cfg(feature = "sui")]
+                {
+                    Ok(Self::Sui(crate::sui::SuiTx::from_json(v)?))
+                }
+                #[cfg(not(feature = "sui"))]
+                Err(
+                    "chain family 'sui' is not supported by this build (missing `sui` feature)"
+                        .to_string(),
+                )
+            }
             Some(other) => Err(format!(
                 "unknown chain family '{other}' — expected one of: evm, svm, sui"
             )),

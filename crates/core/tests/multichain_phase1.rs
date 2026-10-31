@@ -266,6 +266,7 @@ fn from_json_absent_chain_is_legacy_evm() {
             assert_eq!(t.to, TOKEN);
         }
         ChainTx::Svm(_) => panic!("expected Evm"),
+        ChainTx::Sui(_) => panic!("expected Evm"),
     }
 }
 
@@ -279,6 +280,7 @@ fn from_json_explicit_evm_chain() {
     match tx {
         ChainTx::Evm(t) => assert_eq!(t.chain_id, 1),
         ChainTx::Svm(_) => panic!("expected Evm"),
+        ChainTx::Sui(_) => panic!("expected Evm"),
     }
 }
 
@@ -391,10 +393,14 @@ contracts:
         svm.keys().collect::<Vec<_>>()
     );
 
-    // Sui: "module::function" selector, lowercased.
+    // Sui: "module::function" selector, lowercased; address normalized to
+    // the full 64-nibble hex form at load time.
     let sui = contracts
-        .get(&(ChainRef::Sui("mainnet".into()), "0x2".to_string()))
-        .expect("sui contract keyed by package");
+        .get(&(
+            ChainRef::Sui("mainnet".into()),
+            "0x0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+        ))
+        .expect("sui contract keyed by normalized package");
     assert!(
         sui.contains_key("pay::split"),
         "sui selector is module::function, got {:?}",

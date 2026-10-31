@@ -192,6 +192,46 @@ fn svm_eval_ctx(
     }
 }
 
+/// EvalContext for one Sui command (design §6): chain_id/value stay 0,
+/// native amounts live in `args`, per-command synthetic data lives in
+/// `chain_fields`. Addresses are full 64-nibble lowercase hex.
+#[cfg(feature = "sui")]
+#[allow(clippy::too_many_arguments)]
+fn sui_eval_ctx(
+    tx: &crate::sui::SuiTx,
+    to_address: String,
+    command_kind: &str,
+    idx: usize,
+    num_commands: usize,
+    type_arguments: &[String],
+    network: String,
+    args: HashMap<String, serde_json::Value>,
+) -> EvalContext {
+    use alloy_primitives::U256;
+    let mut chain_fields = HashMap::new();
+    chain_fields.insert("command_index".to_string(), serde_json::json!(idx));
+    chain_fields.insert("num_commands".to_string(), serde_json::json!(num_commands));
+    chain_fields.insert("command_kind".to_string(), serde_json::json!(command_kind));
+    chain_fields.insert("gas_budget".to_string(), serde_json::json!(tx.gas_budget));
+    chain_fields.insert("gas_price".to_string(), serde_json::json!(tx.gas_price));
+    chain_fields.insert(
+        "type_arguments".to_string(),
+        serde_json::json!(type_arguments),
+    );
+    EvalContext {
+        chain_id: 0,
+        value: U256::ZERO,
+        args,
+        from_address: tx.from.clone(),
+        to_address,
+        gas_price: 0,
+        gas_limit: 0,
+        vars: HashMap::new(),
+        network,
+        chain_fields,
+    }
+}
+
 /// Factory producing the `$`-builtin provider for one check. Receives the
 /// RPC URL resolved for the transaction's chain (`None` = unknown).
 pub type BuiltinsFactory =
@@ -345,6 +385,11 @@ impl Checker {
             #[cfg(feature = "svm")]
             ChainTx::Svm(tx) => {
                 self.check_svm(tx, ChainRef::Svm(tx.network.clone()), resolver)
+                    .await
+            }
+            #[cfg(feature = "sui")]
+            ChainTx::Sui(tx) => {
+                self.check_sui(tx, ChainRef::Sui(tx.network.clone()), resolver)
                     .await
             }
         }
@@ -522,7 +567,6 @@ impl Checker {
         entry: crate::types::RuleEntry,
         builtins: &Arc<dyn weituo_expr::context::BuiltinProvider>,
     ) -> Result<(), DenyReason> {
-        let where_ = format!("instruction[{idx}] ");
         // Decode args with the rule's Anchor IDL fragment. Decode failures
         // fail closed: args stay empty and any expression referencing them
         // errors (deny).
@@ -542,14 +586,28 @@ impl Checker {
             args,
         );
 
+        self.eval_rule_clauses(&entry, ctx, &format!("instruction[{idx}] "), builtins)
+            .await
+    }
+
+    /// Evaluate a rule entry's clauses against a prepared context — the
+    /// shared tail of every family's per-call pipeline. `where_` prefixes
+    /// denial messages with the call's index (`instruction[i]`/`command[i]`).
+    async fn eval_rule_clauses(
+        &self,
+        entry: &crate::types::RuleEntry,
+        base_ctx: EvalContext,
+        where_: &str,
+        builtins: &Arc<dyn weituo_expr::context::BuiltinProvider>,
+    ) -> Result<(), DenyReason> {
         let mut any_passed = false;
         let mut last_denied = String::new();
         let mut last_failing = None;
         'clauses: for clause in &entry.clauses {
-            let mut instr_ctx = ctx.clone();
-            instr_ctx.vars = clause.vars.clone();
+            let mut ctx = base_ctx.clone();
+            ctx.vars = clause.vars.clone();
             for expr_str in clause.expr.exprs() {
-                match expr::evaluate_explain(expr_str, &instr_ctx, Arc::clone(builtins)).await {
+                match expr::evaluate_explain(expr_str, &ctx, Arc::clone(builtins)).await {
                     Ok((true, _)) => {}
                     Ok((false, explain)) => {
                         last_denied = format!("{where_}{expr_str}");
@@ -616,6 +674,350 @@ impl Checker {
                 Err(e) => {
                     return CheckResult::Denied(DenyReason::EvalError(format!(
                         "instruction[{idx}]: {e}"
+                    )));
+                }
+            }
+        }
+        CheckResult::Ok
+    }
+
+    /// Sui pipeline (design §4/§8.3/§9): the PTB's commands normalize to one
+    /// call per command — native-transfer pairs (§8.3) become synthetic
+    /// calls under the system package with selector `native_transfer`,
+    /// MoveCalls check against their `module::function` rule, and every
+    /// other command fails closed through the policy layer. Denial messages
+    /// carry the command index (`command[1] …`).
+    #[cfg(feature = "sui")]
+    async fn check_sui(
+        &self,
+        tx: &crate::sui::SuiTx,
+        chain: ChainRef,
+        resolver: &dyn ChainResolver,
+    ) -> CheckResult {
+        use crate::sui::tx::{sui_pure_u64, sui_pure_vector, sui_recipient};
+        use crate::sui::{SuiArgument, SuiCommand};
+        use std::collections::HashMap;
+
+        if self.allowlisted(&tx.from, false) {
+            return CheckResult::Ok;
+        }
+
+        let builtins = self.builtins_for(resolver, chain.clone());
+        let network = chain.to_family_network();
+        let num_commands = tx.commands.len();
+
+        // ── Native-transfer dataflow pass (§8.3) ──────────────────────────
+        // Recognized transfers are consumed here and checked as synthetic
+        // `native_transfer` calls; everything else takes the per-command
+        // path (inter-command `Result` references fail closed, §8.2).
+        let mut consumed = vec![false; num_commands];
+        // first-command index → (amount, recipient, kind, type_arguments)
+        let mut synthetic: HashMap<usize, (String, String, &'static str, Vec<String>)> =
+            HashMap::new();
+
+        for i in 0..num_commands {
+            match &tx.commands[i] {
+                SuiCommand::SplitCoins { coin, amounts } => {
+                    // SplitCoins(GasCoin, [Input(a)]) → later
+                    // TransferObjects([Result(i)], Input(r))
+                    let (SuiArgument::GasCoin, [SuiArgument::Input(a)]) =
+                        (coin, amounts.as_slice())
+                    else {
+                        continue;
+                    };
+                    let Some(j) = (i + 1..num_commands).find(|&j| {
+                        matches!(
+                            &tx.commands[j],
+                            SuiCommand::TransferObjects {
+                                objects,
+                                address: SuiArgument::Input(_),
+                                ..
+                            } if matches!(objects.as_slice(), [SuiArgument::Result(n)] if *n == i)
+                        )
+                    }) else {
+                        continue;
+                    };
+                    let (Some(amount), Some(recipient)) = (
+                        sui_pure_u64(&tx.inputs, *a),
+                        sui_recipient(&tx.inputs, &tx.commands[j]),
+                    ) else {
+                        continue;
+                    };
+                    // The TransferObjects is consumed; the SplitCoins slot
+                    // becomes the synthetic native_transfer call.
+                    consumed[j] = true;
+                    synthetic.insert(i, (amount, recipient, "SplitCoins", Vec::new()));
+                }
+                SuiCommand::MoveCall(mc)
+                    if mc.package == crate::sui::SYSTEM_PACKAGE
+                        && mc.module_func() == "pay::pay_sui" =>
+                {
+                    // pay_sui(amounts: vector<u64>, recipients:
+                    // vector<address>) — v1 recognizes the single-transfer
+                    // form; multi-pair calls take the normal rule path.
+                    let [SuiArgument::Input(a), SuiArgument::Input(r)] = mc.arguments.as_slice()
+                    else {
+                        continue;
+                    };
+                    let (Some(amounts), Some(recipients)) = (
+                        sui_pure_vector(&tx.inputs, *a, "u64"),
+                        sui_pure_vector(&tx.inputs, *r, "address"),
+                    ) else {
+                        continue;
+                    };
+                    if amounts.len() == 1 && recipients.len() == 1 {
+                        consumed[i] = true;
+                        synthetic.insert(
+                            i,
+                            (
+                                amounts[0].clone(),
+                                recipients[0].clone(),
+                                "MoveCall",
+                                mc.type_arguments.clone(),
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ── Per-command checks, in command order ──────────────────────────
+        for i in 0..num_commands {
+            // A synthetic native transfer occupies its first command's slot.
+            if let Some((amount, recipient, kind, type_args)) = synthetic.get(&i) {
+                let mut args = HashMap::new();
+                args.insert("amount".to_string(), serde_json::json!(amount));
+                args.insert("recipient".to_string(), serde_json::json!(recipient));
+
+                // Native-transfer gate: allowed unless policy says otherwise.
+                if self.policy.allow_native_transfer {
+                    continue;
+                }
+                // Rule path under the system package (§5: recipient
+                // allowlists work exactly like EVM receive() rules).
+                let display_addr = format!("{} (command[{i}])", crate::sui::SYSTEM_PACKAGE);
+                let rules = match resolver
+                    .contract_rules(chain.clone(), crate::sui::SYSTEM_PACKAGE)
+                    .await
+                {
+                    Some(rules) if !rules.is_empty() => rules,
+                    _ => {
+                        return CheckResult::Denied(DenyReason::NoContract {
+                            address: display_addr,
+                            chain_id: 0,
+                        });
+                    }
+                };
+                let entry = match rules.get("native_transfer").or_else(|| rules.get("*")) {
+                    Some(entry) => entry.clone(),
+                    None => {
+                        return CheckResult::Denied(DenyReason::NoRule {
+                            address: display_addr,
+                            selector: "native_transfer".to_string(),
+                        });
+                    }
+                };
+                let ctx = sui_eval_ctx(
+                    tx,
+                    crate::sui::SYSTEM_PACKAGE.to_string(),
+                    kind,
+                    i,
+                    num_commands,
+                    type_args,
+                    network.clone(),
+                    args,
+                );
+                if let Err(reason) = self
+                    .eval_rule_clauses(&entry, ctx, &format!("command[{i}] "), &builtins)
+                    .await
+                {
+                    return CheckResult::Denied(reason);
+                }
+                continue;
+            }
+
+            if consumed[i] {
+                continue; // paired TransferObjects, already checked
+            }
+
+            match &tx.commands[i] {
+                SuiCommand::MoveCall(mc) => {
+                    let display_addr = format!("{} (command[{i}])", mc.package);
+                    let rules = match resolver.contract_rules(chain.clone(), &mc.package).await {
+                        Some(rules) if !rules.is_empty() => rules,
+                        _ => {
+                            // Token-op gate — only when rule lookup failed
+                            // (design §9). Same targets over the gas coin are
+                            // already consumed by the native-transfer pass.
+                            if mc.package == crate::sui::SYSTEM_PACKAGE
+                                && crate::sui::is_token_op_target(&mc.module_func())
+                            {
+                                match self.policy.token_op_policy {
+                                    TokenOpPolicy::AllowAll => continue,
+                                    TokenOpPolicy::DenyAll => {
+                                        return CheckResult::Denied(DenyReason::TokenOpDenied {
+                                            selector: mc.selector(),
+                                        });
+                                    }
+                                    TokenOpPolicy::Whitelist | TokenOpPolicy::RequireRule => {}
+                                }
+                            }
+                            return CheckResult::Denied(DenyReason::NoContract {
+                                address: display_addr,
+                                chain_id: 0,
+                            });
+                        }
+                    };
+                    let selector = mc.selector();
+                    let entry = match crate::checker::lookup_rules(&rules, &selector) {
+                        RuleLookup::Found(entry) => entry,
+                        RuleLookup::NoContract => {
+                            if mc.package == crate::sui::SYSTEM_PACKAGE
+                                && crate::sui::is_token_op_target(&mc.module_func())
+                            {
+                                match self.policy.token_op_policy {
+                                    TokenOpPolicy::AllowAll => continue,
+                                    TokenOpPolicy::DenyAll => {
+                                        return CheckResult::Denied(DenyReason::TokenOpDenied {
+                                            selector: mc.selector(),
+                                        });
+                                    }
+                                    TokenOpPolicy::Whitelist | TokenOpPolicy::RequireRule => {}
+                                }
+                            }
+                            return CheckResult::Denied(DenyReason::NoContract {
+                                address: display_addr,
+                                chain_id: 0,
+                            });
+                        }
+                        RuleLookup::NoSelector => {
+                            if mc.package == crate::sui::SYSTEM_PACKAGE
+                                && crate::sui::is_token_op_target(&mc.module_func())
+                            {
+                                match self.policy.token_op_policy {
+                                    TokenOpPolicy::AllowAll => continue,
+                                    TokenOpPolicy::DenyAll => {
+                                        return CheckResult::Denied(DenyReason::TokenOpDenied {
+                                            selector: mc.selector(),
+                                        });
+                                    }
+                                    TokenOpPolicy::Whitelist | TokenOpPolicy::RequireRule => {}
+                                }
+                            }
+                            return CheckResult::Denied(DenyReason::NoRule {
+                                address: display_addr,
+                                selector,
+                            });
+                        }
+                    };
+
+                    // Decode args with the rule's Move signature. Decode
+                    // failures fail closed: args stay empty and any
+                    // expression referencing them errors (deny).
+                    let args = match &entry.family_abi {
+                        Some(abi @ crate::types::FamilyAbi::Sui { .. }) => {
+                            crate::sui::decode_sui_args_typed(abi, &mc.arguments, &tx.inputs)
+                                .unwrap_or_default()
+                        }
+                        _ => Default::default(),
+                    };
+                    let ctx = sui_eval_ctx(
+                        tx,
+                        mc.package.clone(),
+                        "MoveCall",
+                        i,
+                        num_commands,
+                        &mc.type_arguments,
+                        network.clone(),
+                        args,
+                    );
+                    if let Err(reason) = self
+                        .eval_rule_clauses(&entry, ctx, &format!("command[{i}] "), &builtins)
+                        .await
+                    {
+                        return CheckResult::Denied(reason);
+                    }
+                }
+                // Creation gate: Publish/Upgrade mint or replace packages.
+                SuiCommand::Publish | SuiCommand::Upgrade => {
+                    if !self.policy.allow_contract_creation {
+                        return CheckResult::Denied(DenyReason::ContractCreationDenied);
+                    }
+                    // Creation allowed — but a non-MoveCall command has no
+                    // rule context. Fail closed.
+                    return CheckResult::Denied(DenyReason::NoContract {
+                        address: format!("{} (command[{i}])", tx.commands[i].kind()),
+                        chain_id: 0,
+                    });
+                }
+                // SplitCoins/MergeCoins/TransferObjects/MakeMoveVec outside
+                // the recognized native-transfer pattern: fail closed.
+                other => {
+                    return CheckResult::Denied(DenyReason::NoContract {
+                        address: format!("{} (command[{i}])", other.kind()),
+                        chain_id: 0,
+                    });
+                }
+            }
+        }
+        CheckResult::Ok
+    }
+
+    /// `waf_testRule` for Sui: evaluate the caller-supplied expr against
+    /// every command using the inline Move signature (`SuiTx.abi`).
+    /// MoveCall commands decode positionally; other commands evaluate with
+    /// empty args. No policy gates — the EVM test path skips them too.
+    #[cfg(feature = "sui")]
+    async fn test_sui(
+        &self,
+        tx: &crate::sui::SuiTx,
+        resolver: Option<&dyn ChainResolver>,
+    ) -> CheckResult {
+        use crate::sui::SuiCommand;
+
+        let expr_str = match &tx.expr {
+            Some(e) => e.clone(),
+            None => return CheckResult::Denied(DenyReason::NoExprInTest),
+        };
+        let builtins = self.builtins_for_opt(resolver, ChainRef::Sui(tx.network.clone()));
+        let num_commands = tx.commands.len();
+        for (idx, cmd) in tx.commands.iter().enumerate() {
+            let (to_address, type_args, args) = match cmd {
+                SuiCommand::MoveCall(mc) => {
+                    let args = match &tx.abi {
+                        Some(abi) => {
+                            crate::sui::decode_sui_args_typed(abi, &mc.arguments, &tx.inputs)
+                                .unwrap_or_default()
+                        }
+                        None => Default::default(),
+                    };
+                    (mc.package.clone(), mc.type_arguments.clone(), args)
+                }
+                _other => (String::new(), Vec::new(), Default::default()),
+            };
+            let mut ctx = sui_eval_ctx(
+                tx,
+                to_address,
+                cmd.kind(),
+                idx,
+                num_commands,
+                &type_args,
+                ChainRef::Sui(tx.network.clone()).to_family_network(),
+                args,
+            );
+            ctx.vars = tx.vars.clone().unwrap_or_default();
+            match expr::evaluate_explain(&expr_str, &ctx, Arc::clone(&builtins)).await {
+                Ok((true, _)) => {}
+                Ok((false, explain)) => {
+                    return CheckResult::Denied(DenyReason::ExpressionDenied {
+                        expr: format!("command[{idx}] {expr_str}"),
+                        explain,
+                    });
+                }
+                Err(e) => {
+                    return CheckResult::Denied(DenyReason::EvalError(format!(
+                        "command[{idx}]: {e}"
                     )));
                 }
             }
@@ -1256,6 +1658,8 @@ impl Checker {
             ChainTx::Evm(tx) => self.test_evm(tx, resolver).await,
             #[cfg(feature = "svm")]
             ChainTx::Svm(tx) => self.test_svm(tx, resolver).await,
+            #[cfg(feature = "sui")]
+            ChainTx::Sui(tx) => self.test_sui(tx, resolver).await,
         }
     }
 
