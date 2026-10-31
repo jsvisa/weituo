@@ -387,6 +387,14 @@ pub struct IdlArg {
     pub ty: serde_json::Value,
 }
 
+impl AsRef<FamilyAbi> for FamilyAbi {
+    /// Reflexive borrow, so family-agnostic call sites can take
+    /// `&FamilyAbi` while callers hold the enum by value.
+    fn as_ref(&self) -> &FamilyAbi {
+        self
+    }
+}
+
 impl FamilyAbi {
     /// Parse an SVM Anchor IDL fragment: `{ name, args: [{name, type}], types? }`.
     /// `args` and `name` are optional (argless programs / bare tag rules).

@@ -27,6 +27,8 @@ pub mod parse_rule;
 pub mod policy;
 pub mod provider;
 pub mod static_loader;
+#[cfg(feature = "sui")]
+pub mod sui;
 #[cfg(feature = "svm")]
 pub mod svm;
 pub mod types;
