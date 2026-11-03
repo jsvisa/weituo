@@ -11,8 +11,8 @@ part meant to be embedded in other services:
 
 | Crate | What it does |
 | --- | --- |
-| [`weituo-expr`](crates/expr) | The rule DSL: a pest-based parser and an async evaluator (`Value`, `EvalContext`, `BuiltinProvider`) |
-| [`weituo-core`](crates/core) | The engine: calldata decoder, chain-data RPC builtins, and the stateless `Checker` (`check(tx, rules) → allow/deny`) |
+| [`weituo-expr`](https://crates.io/crates/weituo-expr) ([source](crates/expr)) | The rule DSL: a pest-based parser and an async evaluator (`Value`, `EvalContext`, `BuiltinProvider`) |
+| [`weituo-core`](https://crates.io/crates/weituo-core) ([source](crates/core)) | The engine: calldata decoder, chain-data RPC builtins, and the stateless `Checker` (`check(tx, rules) → allow/deny`) |
 
 The dependency direction is strictly one-way — `weituo-core` depends on
 `weituo-expr`, never the reverse — so `weituo-expr` can be used standalone for
