@@ -1268,7 +1268,9 @@ mod stateless_tests {
     use super::{CheckResult, Checker};
     use crate::policy::{Policy, TokenOpPolicy};
     use crate::provider::{ChainInfo, StaticResolver};
-    use crate::types::{ExprValue, RuleClause, RuleEntry, Transaction};
+    use crate::types::{
+        Eip712Domain, ExprValue, RuleClause, RuleEntry, Transaction, TypedDataRequest,
+    };
     use std::collections::HashMap;
 
     const TOKEN: &str = "0xdac17f958d2ee523a2206206994597c13d831ec7";
@@ -1388,6 +1390,149 @@ mod stateless_tests {
         match result {
             CheckResult::Denied(reason) => {
                 assert_eq!(reason.code(), -32603); // ExpressionDenied
+            }
+            CheckResult::Ok => panic!("expected denial"),
+        }
+    }
+
+    // ── waf_checkSign (EIP-712): exact rules vs the "*" wildcard fallback ──
+
+    const EXCHANGE: &str = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e";
+    const APPROVED_MAKER: &str = "0x2222222222222222222222222222222222222222";
+    const OTHER_MAKER: &str = "0x9999999999999999999999999999999999999999";
+
+    fn entry_with_vars(expr: &str, vars: &[(&str, serde_json::Value)]) -> RuleEntry {
+        RuleEntry {
+            clauses: vec![RuleClause {
+                expr: ExprValue::Single(expr.into()),
+                vars: vars
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+            }],
+            abi_item: None,
+            multicall: None,
+            invalid_decoder: false,
+        }
+    }
+
+    fn sign_req(domain: &str, primary_type: &str, message: serde_json::Value) -> TypedDataRequest {
+        TypedDataRequest {
+            from: SENDER.into(),
+            primary_type: primary_type.into(),
+            domain: Eip712Domain {
+                chain_id: 1,
+                name: domain.into(),
+                verifying_contract: Some(EXCHANGE.into()),
+            },
+            message: Some(message),
+            messages: None,
+        }
+    }
+
+    /// One exact EIP-712 rule (`order::order` — keys are the lowercased
+    /// `domain::primaryType`, per the static_loader normalization) plus the
+    /// `"*"` wildcard catch-all on the same contract.
+    fn sign_rules() -> HashMap<String, RuleEntry> {
+        HashMap::from([
+            (
+                "order::order".to_string(),
+                entry_with_vars(
+                    "args.maker == vars.approved",
+                    &[("approved", serde_json::json!(APPROVED_MAKER))],
+                ),
+            ),
+            ("*".to_string(), entry("args.amount <= 1000")),
+        ])
+    }
+
+    #[tokio::test]
+    async fn check_sign_exact_rule_passes_when_expr_true() {
+        let rules = HashMap::from([((1u64, EXCHANGE.to_string()), sign_rules())]);
+        let resolver = resolver(rules);
+        let req = sign_req(
+            "order",
+            "order",
+            serde_json::json!({"maker": APPROVED_MAKER, "amount": 1}),
+        );
+        let result = checker(Policy::default()).check_sign(&req, &resolver).await;
+        assert!(matches!(result, CheckResult::Ok));
+    }
+
+    #[tokio::test]
+    async fn check_sign_exact_rule_denied_cites_the_typed_rule_expr() {
+        let rules = HashMap::from([((1u64, EXCHANGE.to_string()), sign_rules())]);
+        let resolver = resolver(rules);
+        let req = sign_req(
+            "order",
+            "order",
+            serde_json::json!({"maker": OTHER_MAKER, "amount": 1}),
+        );
+        let result = checker(Policy::default()).check_sign(&req, &resolver).await;
+        match result {
+            CheckResult::Denied(reason) => {
+                assert_eq!(reason.code(), -32603); // ExpressionDenied
+                let text = reason.to_string();
+                assert!(
+                    text.contains("args.maker == vars.approved"),
+                    "deny must cite the exact rule's expr, got: {text}"
+                );
+            }
+            CheckResult::Ok => panic!("expected denial"),
+        }
+    }
+
+    /// A typed-data request whose `domain::primaryType` has no exact rule falls
+    /// back to the contract's `"*"` wildcard entry, with the message fields
+    /// mapped to `args.*` (no ABI decoding). The wildcard is therefore the
+    /// catch-all for EIP-712 signing too, not just unknown calldata selectors.
+    #[tokio::test]
+    async fn check_sign_miss_falls_back_to_wildcard_rule() {
+        let rules = HashMap::from([((1u64, EXCHANGE.to_string()), sign_rules())]);
+        let resolver = resolver(rules);
+        // "clob::clobauth" has no rule of its own; amount 500 passes the
+        // wildcard expr `args.amount <= 1000`.
+        let req = sign_req("clob", "clobauth", serde_json::json!({"amount": 500}));
+        let result = checker(Policy::default()).check_sign(&req, &resolver).await;
+        assert!(matches!(result, CheckResult::Ok));
+    }
+
+    /// Same fallback, failing side: the deny reason must cite the wildcard
+    /// expr (not `NoSignRule`), proving the wildcard entry was evaluated.
+    #[tokio::test]
+    async fn check_sign_miss_wildcard_expr_false_denies() {
+        let rules = HashMap::from([((1u64, EXCHANGE.to_string()), sign_rules())]);
+        let resolver = resolver(rules);
+        let req = sign_req("clob", "clobauth", serde_json::json!({"amount": 5000}));
+        let result = checker(Policy::default()).check_sign(&req, &resolver).await;
+        match result {
+            CheckResult::Denied(reason) => {
+                let text = reason.to_string();
+                assert!(
+                    text.contains("args.amount <= 1000"),
+                    "deny must cite the wildcard expr, got: {text}"
+                );
+            }
+            CheckResult::Ok => panic!("expected denial"),
+        }
+    }
+
+    /// The wildcard only fires when the contract HAS rules at all; on a
+    /// contract with no rules, an unknown `domain::primaryType` still denies
+    /// by default (fail-closed `NoSignRule`).
+    #[tokio::test]
+    async fn check_sign_contract_without_rules_denies_by_default() {
+        let resolver = resolver(HashMap::new());
+        let req = sign_req("clob", "clobauth", serde_json::json!({"amount": 500}));
+        let result = checker(Policy::default()).check_sign(&req, &resolver).await;
+        match result {
+            CheckResult::Denied(reason) => {
+                assert_eq!(reason.code(), -32601); // NoSignRule
+                let text = reason.to_string();
+                assert!(
+                    text.contains("no EIP-712 rule configured for clob::clobauth"),
+                    "unexpected reason: {text}"
+                );
             }
             CheckResult::Ok => panic!("expected denial"),
         }
