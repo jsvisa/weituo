@@ -6,13 +6,13 @@ Reusable Rust libraries for **EVM transaction and signature rule checking**.
 
 The service layer — HTTP JSON-RPC server, request authentication, metrics,
 concrete rule providers and their caches, price oracles, scam lists — is
-intentionally *not* part of this repository. What is here is the stateless
+intentionally _not_ part of this repository. What is here is the stateless
 part meant to be embedded in other services:
 
-| Crate | What it does |
-| --- | --- |
-| [`weituo-expr`](crates/expr) | The rule DSL: a pest-based parser and an async evaluator (`Value`, `EvalContext`, `BuiltinProvider`) |
-| [`weituo-core`](crates/core) | The engine: calldata decoder, chain-data RPC builtins, and the stateless `Checker` (`check(tx, rules) → allow/deny`) |
+| Crate                                                                         | What it does                                                                                                         |
+| ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| [`weituo-expr`](https://crates.io/crates/weituo-expr) ([source](crates/expr)) | The rule DSL: a pest-based parser and an async evaluator (`Value`, `EvalContext`, `BuiltinProvider`)                 |
+| [`weituo-core`](https://crates.io/crates/weituo-core) ([source](crates/core)) | The engine: calldata decoder, chain-data RPC builtins, and the stateless `Checker` (`check(tx, rules) → allow/deny`) |
 
 The dependency direction is strictly one-way — `weituo-core` depends on
 `weituo-expr`, never the reverse — so `weituo-expr` can be used standalone for
@@ -70,21 +70,20 @@ impl RuleResolver for MyRules {
 }
 
 async fn run() -> anyhow::Result<()> {
-let checker = Checker::new(reqwest::Client::new(), Vec::new(), Policy::default());
-let tx: Transaction = serde_json::from_str(r#"{
-    "chainId": 1, "from": "0x…", "to": "0x…", "data": "0x…", "value": 0
-}"#)?;
+    let checker = Checker::new(reqwest::Client::new(), Vec::new(), Policy::default());
+    let tx: Transaction = serde_json::from_str(r#"{
+        "chainId": 1, "from": "0x…", "to": "0x…", "data": "0x…", "value": 0
+    }"#)?;
 
-match checker.check(&tx, &MyRules).await {
-    CheckResult::Ok => println!("allowed"),
-    CheckResult::Denied(reason) => println!("denied: {reason}"),
-}
-Ok(())
+    match checker.check(&tx, &MyRules).await {
+        CheckResult::Ok => println!("allowed"),
+        CheckResult::Denied(reason) => println!("denied: {reason}"),
+    }
+    Ok(())
 }
 ```
 
-A compiling version lives in
-[`crates/core/examples/embed_checker.rs`](crates/core/examples/embed_checker.rs)
+A compiling version lives in [`crates/core/examples/embed_checker.rs`](crates/core/examples/embed_checker.rs)
 (`cargo run -p weituo-core --example embed_checker`).
 
 ## Architecture
@@ -108,7 +107,7 @@ own list, deny before calling the checker.
 ## Development
 
 ```sh
-cargo +nightly fmt --all                                              # rustfmt runs on nightly
+cargo +nightly fmt --all   # rustfmt runs on nightly
 cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
