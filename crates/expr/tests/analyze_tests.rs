@@ -369,3 +369,52 @@ fn no_param_types_skips_type_checking() {
         "empty param_types = skip type check: {errs:?}"
     );
 }
+
+#[test]
+fn tuple_array_member_without_index_is_rejected() {
+    let types = types_map(&[("orders", "tuple[]"), ("orders.amount", "uint256")]);
+    let errs = validate_full(
+        "args.orders.amount > 1",
+        &["orders"],
+        KNOWN_BUILTINS,
+        &types,
+        &no_vars(),
+    );
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("args.orders"), "{}", errs[0]);
+    assert!(errs[0].contains("args.orders[0].amount"), "{}", errs[0]);
+}
+
+#[test]
+fn array_member_access_other_than_length_is_rejected() {
+    let types = types_map(&[("ids", "uint256[]")]);
+    let errs = validate_full(
+        "args.ids.foo > 1",
+        &["ids"],
+        KNOWN_BUILTINS,
+        &types,
+        &no_vars(),
+    );
+    assert_eq!(errs.len(), 1, "{errs:?}");
+}
+
+#[test]
+fn indexed_and_length_array_paths_still_validate() {
+    let types = types_map(&[
+        ("orders", "tuple[]"),
+        ("orders.amount", "uint256"),
+        ("orders.inner", "tuple"),
+        ("orders.inner.x", "uint256"),
+        ("ids", "uint256[]"),
+    ]);
+    for expr in [
+        "args.orders[0].amount > 1",
+        "args.orders[1].inner.x > 1",
+        "args.orders.length > 0",
+        "args.ids[0] > 1",
+        "args.ids.length > 0",
+    ] {
+        let errs = validate_full(expr, &["orders", "ids"], KNOWN_BUILTINS, &types, &no_vars());
+        assert!(errs.is_empty(), "{expr}: {errs:?}");
+    }
+}

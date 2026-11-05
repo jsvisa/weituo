@@ -234,10 +234,8 @@ fn walk(
                     }
                 }
                 if !param_types.is_empty() {
-                    if let Some(path) = unknown_args_attr_path(expr, param_types) {
-                        errors.push(SemanticError {
-                            message: format!("unknown arg '{path}'"),
-                        });
+                    if let Some(message) = args_attr_error(expr, param_types) {
+                        errors.push(SemanticError { message });
                     }
                 }
             }
@@ -426,14 +424,17 @@ fn solidity_type_for_args_attr<'a>(
             solidity_type,
             path,
         } => Some((solidity_type, path)),
-        ArgsAttrResolution::Unknown { .. } => None,
+        ArgsAttrResolution::Unknown { .. } | ArgsAttrResolution::ArrayNeedsIndex { .. } => None,
     }
 }
 
-fn unknown_args_attr_path(expr: &Expr, param_types: &HashMap<String, String>) -> Option<String> {
+fn args_attr_error(expr: &Expr, param_types: &HashMap<String, String>) -> Option<String> {
     match resolve_args_attr(expr, param_types)? {
         ArgsAttrResolution::Known { .. } => None,
-        ArgsAttrResolution::Unknown { path } => Some(path),
+        ArgsAttrResolution::Unknown { path } => Some(format!("unknown arg '{path}'")),
+        ArgsAttrResolution::ArrayNeedsIndex { path, field } => Some(format!(
+            "'{path}' is an array: index it before accessing '.{field}' (e.g. {path}[0].{field}); only '.length' is allowed on the array itself"
+        )),
     }
 }
 
@@ -444,6 +445,13 @@ enum ArgsAttrResolution<'a> {
     },
     Unknown {
         path: String,
+    },
+    /// A member access on an array-typed segment without an index, e.g.
+    /// `args.orders.amount` for `orders: tuple[]`. It passes the path lookup
+    /// (the type map is keyed by member path) but never matches at runtime.
+    ArrayNeedsIndex {
+        path: String,
+        field: String,
     },
 }
 
@@ -465,12 +473,19 @@ fn resolve_args_attr<'a>(
         for segment in &parts[2..] {
             match segment {
                 AttrSegment::Field(field) => {
+                    if is_array_type(solidity_type) {
+                        if field == "length" {
+                            display_path.push_str(".length");
+                            solidity_type = "uint256";
+                            continue;
+                        }
+                        return Some(ArgsAttrResolution::ArrayNeedsIndex {
+                            path: display_path,
+                            field: field.to_string(),
+                        });
+                    }
                     display_path.push('.');
                     display_path.push_str(field);
-                    if field == "length" && is_array_type(solidity_type) {
-                        solidity_type = "uint256";
-                        continue;
-                    }
                     field_path.push('.');
                     field_path.push_str(field);
                     let Some(component_type) = param_types.get(&field_path).map(String::as_str)
