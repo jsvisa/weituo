@@ -92,20 +92,30 @@ fn build_expr(pair: Pair<Rule>) -> Result<Expr> {
                 Rule::in_op => {
                     // in_op contains kw_not+kw_in (negated) or just kw_in
                     let negated = op_pair.into_inner().any(|p| p.as_rule() == Rule::kw_not);
-                    let list_pair = inner.next().unwrap(); // this is array_lit
-                    let list = list_pair
-                        .into_inner() // yields array_element nodes
-                        .map(|elem| {
-                            // each array_element contains exactly one child: attribute or literal
-                            let child = elem.into_inner().next().unwrap();
-                            build_expr(child)
+                    let list_pair = inner.next().unwrap();
+                    if list_pair.as_rule() == Rule::array_lit {
+                        let list = list_pair
+                            .into_inner() // yields array_element nodes
+                            .map(|elem| {
+                                // each array_element contains exactly one child: attribute or literal
+                                let child = elem.into_inner().next().unwrap();
+                                build_expr(child)
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(Expr::In {
+                            val: Box::new(lhs),
+                            list,
+                            negated,
                         })
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(Expr::In {
-                        val: Box::new(lhs),
-                        list,
-                        negated,
-                    })
+                    } else {
+                        // `x in <expr>` — runtime list value (e.g. vars.wallets)
+                        let source = build_expr(list_pair)?;
+                        Ok(Expr::InSource {
+                            val: Box::new(lhs),
+                            source: Box::new(source),
+                            negated,
+                        })
+                    }
                 }
                 _ => Ok(lhs),
             }

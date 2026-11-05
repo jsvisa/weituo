@@ -37,6 +37,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
       - run: cargo build -p weituo-core --examples
+      # Feature-combination gate: the engine must compile (and the EVM
+      # pipeline must pass its tests) with each family toggled off.
+      - run: cargo test -p weituo-core --no-default-features
+      - run: cargo test -p weituo-core --no-default-features --features svm
+      - run: cargo test -p weituo-core --no-default-features --features sui
+      - run: cargo build -p weituo-core --examples --no-default-features
 
   package:
     runs-on: ubuntu-latest

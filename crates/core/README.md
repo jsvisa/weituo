@@ -1,17 +1,26 @@
 # weituo-core
 
-The reusable EVM WAF rule-check engine: it evaluates transactions and EIP-712
-signatures against rules expressed in the [`weituo-expr`](../expr) DSL. No HTTP
-server, no auth, no metrics, **no configuration, no state** — everything
-stateful belongs to the embedding service.
+The reusable WAF rule-check engine: it evaluates transactions and signatures
+against rules expressed in the [`weituo-expr`](../expr) DSL, across three
+chain families — **EVM**, **SVM** (Solana) and **Sui**. No HTTP server, no
+auth, no metrics, **no configuration, no state** — everything stateful
+belongs to the embedding service. The multichain design lives in
+[`docs/design-multichain.md`](../design-multichain.md).
 
 ```toml
 [dependencies]
-weituo-core = "0.2"
+weituo-core = "0.3"
 reqwest     = "0.12"   # used by Builtins for chain RPC helpers
 tokio       = "1"
 anyhow      = "1"
 ```
+
+Feature flags (EVM checking is always on):
+
+| Feature | Default | What it pulls in |
+| --- | --- | --- |
+| `svm` | ✅ | Solana instruction checking (`base58`, `sha2` for Anchor discriminators) |
+| `sui` | ✅ | Sui PTB checking (BCS encode/decode is hand-rolled, no extra deps) |
 
 ## Concepts
 
@@ -51,6 +60,37 @@ invoking the checker.
 
 Denials come back as a typed `DenyReason` (which renders to a JSON-RPC error
 with `to_rpc_error()`), so callers can map them to their own protocol.
+
+## Multichain checking
+
+The unified entry points take a [`ChainTx`](src/chain.rs) — a JSON payload
+tagged with `"chain": "evm" | "svm" | "sui"` (absent → legacy strict EVM
+parse, so existing payloads are unchanged):
+
+- `Checker::check_tx(&ChainTx, &ChainResolver)` — the `check` counterpart;
+- `Checker::test_tx(&ChainTx, Option<&ChainResolver>)` — the `test` counterpart.
+
+`ChainResolver` keys rules by `ChainRef` (`Evm(u64)`, `Svm(network)`,
+`Sui(network)`); `StaticResolver::new_multi` / `static_loader::load_multi`
+build one from in-memory rules / YAML.
+
+Per family (§3/§5/§8/§9 of the design doc):
+
+| | EVM | SVM | Sui |
+| --- | --- | --- | --- |
+| payload | `chainId` + `data` | `instructions[]` (base58) | PTB `inputs` + `commands` |
+| rule key | 4-byte selector hex | Anchor `sha256("global:"+fn)[..8]` or `0x`-hex verbatim | lowercase `module::function` |
+| address key | checksummed hex | base58 verbatim | 64-nibble lowercase hex (`0x2` → `0x000…0002`) |
+| args | alloy ABI decode | Anchor IDL + borsh | Move signature + BCS |
+| native transfer | empty calldata | `System::Transfer` | `SplitCoins(GasCoin)`+`TransferObjects` pairs and single-pair `pay_sui` (§8.3) |
+| token ops | `transfer`/`approve` selectors | SPL token programs | `0x2::coin::transfer`, `0x2::pay::*` targets |
+| creation gate | `to == ""` | n/a | `Publish` / `Upgrade` commands |
+
+SVM and Sui payloads carry no numeric value: `args.*` holds only IDL-decoded
+parameters, and per-instruction / per-command synthetic data lives in
+`chain_fields` (`instruction_index`, `accounts`, `signers` / `command_index`,
+`command_kind`, `gas_budget`, `type_arguments`, …). Decode failures and
+unresolved inter-command references fail closed.
 
 ## Embedding
 
