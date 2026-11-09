@@ -1,7 +1,22 @@
 use crate::types::{expression_param_names, expression_param_types, AbiItem, JsonRpcResponse};
 use std::collections::HashMap;
 
+/// Validate a rule expression against the engine's default `$` builtins
+/// ([`KNOWN_BUILTINS`](weituo_expr::analyze::KNOWN_BUILTINS)).
 pub fn parse_rule_param(id: serde_json::Value, param: &serde_json::Value) -> JsonRpcResponse {
+    parse_rule_param_with_builtins(id, param, weituo_expr::analyze::KNOWN_BUILTINS)
+}
+
+/// Like [`parse_rule_param`], but validates `$name(...)` calls against
+/// `known_builtins`. Embeddings that install extra builtins via
+/// [`Checker::with_builtins_factory`](crate::checker::Checker::with_builtins_factory)
+/// pass the default list extended with their own names, e.g.
+/// `[KNOWN_BUILTINS, &["is_xxx_approved"]].concat()`.
+pub fn parse_rule_param_with_builtins(
+    id: serde_json::Value,
+    param: &serde_json::Value,
+    known_builtins: &[&str],
+) -> JsonRpcResponse {
     let expr = match param.get("expr").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -41,7 +56,7 @@ pub fn parse_rule_param(id: serde_json::Value, param: &serde_json::Value) -> Jso
     let all_errors: Vec<serde_json::Value> = weituo_expr::validate_full(
         &expr,
         &param_refs,
-        weituo_expr::analyze::KNOWN_BUILTINS,
+        known_builtins,
         &param_types,
         &var_values,
     )

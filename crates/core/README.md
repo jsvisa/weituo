@@ -147,6 +147,19 @@ impl BuiltinProvider for MyBuiltins {
 //     }));
 ```
 
+Rule validation (`parse_rule::parse_rule_param`) only accepts the engine's
+default `$` names (`weituo_expr::analyze::KNOWN_BUILTINS`). If you add new
+names, validate with `parse_rule_param_with_builtins` and pass the extended
+list:
+
+```rust
+use weituo_core::parse_rule::parse_rule_param_with_builtins;
+use weituo_expr::analyze::KNOWN_BUILTINS;
+
+let known = [KNOWN_BUILTINS, &["is_xxx_approved"]].concat();
+let resp = parse_rule_param_with_builtins(id, &params, &known);
+```
+
 ## Tests
 
 ```sh
