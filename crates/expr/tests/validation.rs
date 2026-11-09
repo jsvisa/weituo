@@ -86,12 +86,6 @@ fn valid_known_builtin() {
 }
 
 #[test]
-fn is_scam_is_a_known_builtin() {
-    let errs = vfull("$is_scam(args.spender)", &no_abi());
-    assert!(errs.is_empty(), "unexpected validation errors: {errs:?}");
-}
-
-#[test]
 fn is_scam_addr_is_no_longer_a_known_builtin() {
     let errs = vfull("$is_scam_addr(args.spender)", &no_abi());
     assert!(errs.iter().any(|error| error.contains("unknown builtin")));
@@ -100,6 +94,7 @@ fn is_scam_addr_is_no_longer_a_known_builtin() {
 #[test]
 fn approved_list_builtins_are_no_longer_known_builtins() {
     for name in [
+        "is_scam",
         "is_approved_token",
         "is_approved_spender",
         "is_not_blocked_spender",

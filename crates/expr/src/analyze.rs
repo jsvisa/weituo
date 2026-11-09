@@ -55,7 +55,6 @@ pub const KNOWN_BUILTINS: &[&str] = &[
     "erc20_allowance",
     "erc20_total_supply",
     "erc20_decimals",
-    "is_scam",
     "b32int2addr",
 ];
 
