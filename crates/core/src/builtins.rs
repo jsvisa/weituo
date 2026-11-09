@@ -10,14 +10,14 @@ use weituo_expr::EvalContext;
 /// Core engine builtins: generic chain-data helpers (`$block`, `$balance_of`,
 /// `$erc20_*`, `$gas_price`, `$now_ts`, `$pow`, …).
 ///
-/// External-data builtins (`$price_of`, `$is_scam`) are *not* part of core —
+/// External-data builtins (`$price_of`, `$is_scam`, `$is_approved_token`,
+/// `$is_approved_spender`, `$is_not_blocked_spender`) are *not* part of core —
 /// embeddings provide them via a composite
 /// [`BuiltinProvider`](weituo_expr::context::BuiltinProvider) passed to
 /// [`crate::checker::Checker::new_with_builtins`].
 /// The engine's `$`-builtin provider: chain data read over JSON-RPC
 /// (`$block`, `$gas_price`, `$balance_of`, `$erc20_*`, `$is_contract`,
-/// `$is_eoa`) plus pure helpers (`$now_ts`, `$pow`, `$b32int2addr`,
-/// `$is_approved_token`, …).
+/// `$is_eoa`) plus pure helpers (`$now_ts`, `$pow`, `$b32int2addr`).
 ///
 /// An instance is bound to one chain's RPC endpoint and holds no mutable
 /// state — construct one per check (or reuse it freely; it is `Clone`-cheap:
@@ -62,9 +62,6 @@ impl Builtins {
             "erc20_allowance" => self.erc20_call("allowance", args, ctx).await,
             "erc20_total_supply" => self.erc20_call("totalSupply", args, ctx).await,
             "erc20_decimals" => self.erc20_call("decimals", args, ctx).await,
-            "is_approved_token" => Ok(Value::Bool(false)),
-            "is_approved_spender" => Ok(Value::Bool(false)),
-            "is_not_blocked_spender" => Ok(Value::Bool(true)),
             "b32int2addr" => {
                 // Accept address encoded as: uint256 decimal → BigUint, hex string, or i64
                 let hex = match args.first() {
@@ -281,10 +278,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn price_of_is_no_longer_a_core_builtin() {
-        // Price/scam data moved to the embedding layer; core must no longer
-        // answer `$price_of` / `$is_scam`.
-        for name in ["price_of", "is_scam", "is_scam_addr"] {
+    async fn external_data_builtins_are_not_core_builtins() {
+        // Price/scam/approved-list data belongs to the embedding layer; core
+        // must not answer these (a fixed stub answer would silently allow or
+        // deny everything when an embedding forgets to override it).
+        for name in [
+            "price_of",
+            "is_scam",
+            "is_scam_addr",
+            "is_approved_token",
+            "is_approved_spender",
+            "is_not_blocked_spender",
+        ] {
             let error = builtins(None)
                 .call(name, &[Value::Str("0x0".into())], &eval_context())
                 .await
