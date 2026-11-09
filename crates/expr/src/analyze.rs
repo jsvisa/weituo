@@ -43,7 +43,6 @@ impl std::fmt::Display for SemanticError {
 }
 
 pub const KNOWN_BUILTINS: &[&str] = &[
-    "price_of",
     "now_ts",
     "pow",
     "block",

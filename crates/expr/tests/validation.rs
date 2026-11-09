@@ -81,7 +81,7 @@ fn valid_simple_comparison() {
 
 #[test]
 fn valid_known_builtin() {
-    let errs = vfull("$price_of(args.token) > 100", &no_abi());
+    let errs = vfull("$erc20_decimals(args.token) > 6", &no_abi());
     assert!(errs.is_empty());
 }
 
@@ -92,8 +92,9 @@ fn is_scam_addr_is_no_longer_a_known_builtin() {
 }
 
 #[test]
-fn approved_list_builtins_are_no_longer_known_builtins() {
+fn external_data_builtins_are_no_longer_known_builtins() {
     for name in [
+        "price_of",
         "is_scam",
         "is_approved_token",
         "is_approved_spender",
@@ -132,7 +133,7 @@ fn unknown_builtin_mentions_available() {
     let errs = vfull("$foobar(x)", &no_abi());
     assert!(!errs.is_empty());
     assert!(
-        errs[0].contains("price_of"),
+        errs[0].contains("erc20_decimals"),
         "error should list known builtins: {:?}",
         errs
     );
@@ -313,9 +314,9 @@ fn erc20_decimals_used_correctly() {
 }
 
 #[test]
-fn price_of_with_unknown_arg() {
+fn builtin_with_unknown_arg() {
     let params = vec!["token"];
-    let errs = vfull("$price_of(args.wrongName) > 100", &params);
+    let errs = vfull("$erc20_decimals(args.wrongName) > 6", &params);
     assert!(!errs.is_empty());
     assert!(errs[0].contains("wrongName"));
 }
