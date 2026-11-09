@@ -54,7 +54,6 @@ pub const KNOWN_BUILTINS: &[&str] = &[
     "erc20_allowance",
     "erc20_total_supply",
     "erc20_decimals",
-    "b32int2addr",
 ];
 
 /// Plain function calls supported by the evaluator, mapped to their arity.

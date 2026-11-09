@@ -40,17 +40,6 @@ impl BuiltinProvider for MockBuiltins {
                 let exp = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
                 return Ok(Value::Float(base.powf(exp)));
             }
-            "b32int2addr" => {
-                let raw = match args.first() {
-                    Some(Value::Str(s)) => s.clone(),
-                    Some(Value::Int(i)) => format!("{i:x}"),
-                    _ => "0".into(),
-                };
-                let hex = raw.trim_start_matches("0x");
-                let padded = format!("{:0>40}", hex);
-                let addr = &padded[padded.len().saturating_sub(40)..];
-                return Ok(Value::Str(format!("0x{addr}")));
-            }
             _ => {}
         }
         self.responses
@@ -411,23 +400,6 @@ async fn price_of_mocked() {
         .with("price_of", Value::Float(2500.0))
         .arc();
     assert!(eval_with("$price_of(token) > 100", &ctx(), b).await);
-}
-
-#[tokio::test]
-async fn b32int2addr_builtin() {
-    // From test_context.py: b32int2addr(1364068194842176056990105843868530818345537040110)
-    // == 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-    let ctx = ctx_with_args(&[(
-        "fromToken",
-        serde_json::json!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
-    )]);
-    assert!(
-        eval(
-            "$b32int2addr(args.fromToken) == '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'",
-            &ctx
-        )
-        .await
-    );
 }
 
 #[tokio::test]

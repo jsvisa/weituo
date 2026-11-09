@@ -17,7 +17,7 @@ use weituo_expr::EvalContext;
 /// [`crate::checker::Checker::new_with_builtins`].
 /// The engine's `$`-builtin provider: chain data read over JSON-RPC
 /// (`$block`, `$gas_price`, `$balance_of`, `$erc20_*`, `$is_contract`,
-/// `$is_eoa`) plus pure helpers (`$now_ts`, `$pow`, `$b32int2addr`).
+/// `$is_eoa`) plus pure helpers (`$now_ts`, `$pow`).
 ///
 /// An instance is bound to one chain's RPC endpoint and holds no mutable
 /// state — construct one per check (or reuse it freely; it is `Clone`-cheap:
@@ -62,28 +62,6 @@ impl Builtins {
             "erc20_allowance" => self.erc20_call("allowance", args, ctx).await,
             "erc20_total_supply" => self.erc20_call("totalSupply", args, ctx).await,
             "erc20_decimals" => self.erc20_call("decimals", args, ctx).await,
-            "b32int2addr" => {
-                // Accept address encoded as: uint256 decimal → BigUint, hex string, or i64
-                let hex = match args.first() {
-                    Some(Value::BigUint(u)) => format!("{u:x}"),
-                    Some(Value::Str(s)) if s.starts_with("0x") || s.starts_with("0X") => {
-                        s[2..].to_string()
-                    }
-                    Some(Value::Str(s)) => {
-                        // Decimal string — parse as U256 and convert to hex
-                        if let Ok(u) = s.parse::<U256>() {
-                            format!("{u:x}")
-                        } else {
-                            s.clone()
-                        }
-                    }
-                    Some(Value::Int(i)) => format!("{i:x}"),
-                    _ => return Err(anyhow!("$b32int2addr: expected uint256 or address string")),
-                };
-                let padded = format!("{:0>40}", hex);
-                let addr_hex = &padded[padded.len().saturating_sub(40)..];
-                Ok(Value::Str(format!("0x{addr_hex}")))
-            }
             _ => Err(anyhow!("unknown builtin: ${name}")),
         }
     }
