@@ -12,7 +12,7 @@ fn default_builtins_reject_custom_name() {
 
 #[test]
 fn extended_builtins_accept_custom_name() {
-    let known = [KNOWN_BUILTINS, &["is_xxx_approved"]].concat();
+    let known = [KNOWN_BUILTINS, &["is_xxx_approved", "price_of"]].concat();
     let resp = parse_rule_param_with_builtins(
         json!(1),
         &json!({ "expr": "$is_xxx_approved(to_address) and $price_of(to_address) > 1" }),

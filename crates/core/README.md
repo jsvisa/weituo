@@ -21,7 +21,7 @@ anyhow      = "1"
 | `provider::RuleResolver` | What the checker consumes per call: `contract_rules(chain, address)` + `chain_rpc_url(chain)`. Typically a TTL cache sitting on a `RuleProvider`. `StaticResolver` is an in-memory implementation. |
 | `static_loader` | Loads rules from local YAML + ABI JSON files (`waf.yaml` style) — one call, no daemon. |
 | `decoder` | Decodes calldata against the rule's ABI (`alloy-dyn-abi`), including tuples and arrays; builds multicall decoders. |
-| `builtins::Builtins` | The engine's `$` builtins: chain data read over JSON-RPC (`$block`, `$gas_price`, `$balance_of`, `$erc20_*`, `$is_contract`, …) plus pure helpers (`$now_ts`, `$pow`, `$b32int2addr`). Bound to one chain's RPC endpoint, no internal state. |
+| `builtins::Builtins` | The engine's `$` builtins: chain data read over JSON-RPC (`$block`, `$gas_price`, `$balance_of`, `$erc20_*`, `$is_contract`, …) plus pure helpers (`$now_ts`, `$pow`). Bound to one chain's RPC endpoint, no internal state. |
 | `checker::Checker` | The decision engine. Holds only the `Policy`, the allowlist and an HTTP client — constructed once, called many times. |
 | `policy::Policy` | Plain parameter struct: transaction-type allowlist, contract-creation / native-transfer gates, token-op policy. |
 | `parse_rule` | Syntax + semantic validation of a single rule expression, for rule-authoring UIs. |

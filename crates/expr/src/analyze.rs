@@ -43,7 +43,6 @@ impl std::fmt::Display for SemanticError {
 }
 
 pub const KNOWN_BUILTINS: &[&str] = &[
-    "price_of",
     "now_ts",
     "pow",
     "block",
@@ -55,11 +54,6 @@ pub const KNOWN_BUILTINS: &[&str] = &[
     "erc20_allowance",
     "erc20_total_supply",
     "erc20_decimals",
-    "is_approved_token",
-    "is_approved_spender",
-    "is_not_blocked_spender",
-    "is_scam",
-    "b32int2addr",
 ];
 
 /// Plain function calls supported by the evaluator, mapped to their arity.
