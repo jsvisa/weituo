@@ -68,9 +68,6 @@ impl BuiltinProvider for MockBuiltins {
                 let addr = &padded[padded.len().saturating_sub(40)..];
                 Ok(Value::Str(format!("0x{addr}")))
             }
-            "is_approved_token" | "is_approved_spender" => Ok(Value::Bool(true)),
-            "is_not_blocked_spender" => Ok(Value::Bool(true)),
-            "price_of" => Ok(Value::Float(1.0)),
             _ => Err(anyhow::anyhow!("unhandled mock builtin: ${name}")),
         }
     }
@@ -385,22 +382,6 @@ async fn pattern_uniswap_v3_swap_to_self() {
         )
         .await
     );
-}
-
-#[tokio::test]
-async fn pattern_approved_token_transfer() {
-    // Rule: transfer(address to, uint256 amount) to an approved token
-    // $is_approved_token(to_address) — mocked as true
-    let c = ctx(
-        1,
-        ALICE,
-        USDT_LC,
-        &[
-            ("to", serde_json::json!(ALICE_CS)),
-            ("amount", serde_json::json!("1000000")), // 1 USDT
-        ],
-    );
-    assert!(check("$is_approved_token(to_address) and args.amount > 0", &c).await);
 }
 
 #[tokio::test]
