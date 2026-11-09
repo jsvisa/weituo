@@ -98,6 +98,21 @@ fn is_scam_addr_is_no_longer_a_known_builtin() {
 }
 
 #[test]
+fn approved_list_builtins_are_no_longer_known_builtins() {
+    for name in [
+        "is_approved_token",
+        "is_approved_spender",
+        "is_not_blocked_spender",
+    ] {
+        let errs = vfull(&format!("${name}(args.spender)"), &no_abi());
+        assert!(
+            errs.iter().any(|error| error.contains("unknown builtin")),
+            "{name} still accepted: {errs:?}"
+        );
+    }
+}
+
+#[test]
 fn valid_context_fields() {
     // from_address, to_address, chainId, value are always valid
     let errs = vfull("from_address == '0xdeadbeef'", &no_abi());
