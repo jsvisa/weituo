@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tracing::warn;
 
+use crate::chain::{ChainRef, ChainResolver};
 use crate::decoder::build_decoder;
 use crate::types::{ExprValue, Rule, RuleClause, RuleEntry};
 
@@ -53,22 +54,53 @@ pub trait RuleResolver: Send + Sync {
 /// A [`RuleResolver`] over in-memory data — feed it the output of
 /// [`crate::static_loader::load`] or your own prepared rules.
 /// No I/O, no caching, no background tasks.
+///
+/// Rules are stored under [`ChainRef`] keys; the legacy constructors route
+/// numeric ids to [`ChainRef::Evm`].
 pub struct StaticResolver {
-    contracts: HashMap<(u64, String), HashMap<String, RuleEntry>>,
-    rpc_urls: HashMap<u64, String>,
+    contracts: HashMap<(ChainRef, String), HashMap<String, RuleEntry>>,
+    rpc_urls: HashMap<ChainRef, String>,
 }
 
 impl StaticResolver {
     /// `contracts`: (chain_id, address) → selector → rule, `chains`: per-chain
-    /// info (non-empty `rpc_url`s are used for the `$`-builtins).
+    /// info (non-empty `rpc_url`s are used for the `$`-builtins). Legacy
+    /// EVM-only constructor — keys route to [`ChainRef::Evm`].
     pub fn new(
         contracts: HashMap<(u64, String), HashMap<String, RuleEntry>>,
         chains: HashMap<u64, ChainInfo>,
     ) -> Self {
+        Self::new_multi(
+            contracts
+                .into_iter()
+                .map(|((n, a), r)| ((ChainRef::Evm(n), a), r))
+                .collect(),
+            chains
+                .into_iter()
+                .map(|(n, info)| (ChainRef::Evm(n), info))
+                .collect(),
+        )
+    }
+
+    /// Multi-chain constructor taking [`ChainRef`] keys directly (the output
+    /// shape of [`crate::static_loader::load_multi`]). EVM addresses are
+    /// lowercased on the way in; SVM (base58, case-sensitive) and Sui
+    /// addresses are stored verbatim.
+    pub fn new_multi(
+        contracts: HashMap<(ChainRef, String), HashMap<String, RuleEntry>>,
+        chains: HashMap<ChainRef, ChainInfo>,
+    ) -> Self {
+        let contracts = contracts
+            .into_iter()
+            .map(|((chain, addr), rules)| {
+                let addr = chain.normalize_address(&addr);
+                ((chain, addr), rules)
+            })
+            .collect();
         let rpc_urls = chains
             .into_iter()
             .filter(|(_, info)| !info.rpc_url.is_empty())
-            .map(|(chain_id, info)| (chain_id, info.rpc_url))
+            .map(|(chain, info)| (chain, info.rpc_url))
             .collect();
         Self {
             contracts,
@@ -85,12 +117,28 @@ impl RuleResolver for StaticResolver {
         address: &str,
     ) -> Option<HashMap<String, RuleEntry>> {
         self.contracts
-            .get(&(chain_id, address.to_lowercase()))
+            .get(&(ChainRef::Evm(chain_id), address.to_lowercase()))
             .cloned()
     }
 
     fn chain_rpc_url(&self, chain_id: u64) -> Option<String> {
-        self.rpc_urls.get(&chain_id).cloned()
+        self.rpc_urls.get(&ChainRef::Evm(chain_id)).cloned()
+    }
+}
+
+#[async_trait]
+impl ChainResolver for StaticResolver {
+    async fn contract_rules(
+        &self,
+        chain: ChainRef,
+        address: &str,
+    ) -> Option<HashMap<String, RuleEntry>> {
+        let address = chain.normalize_address(address);
+        self.contracts.get(&(chain, address)).cloned()
+    }
+
+    fn chain_rpc_url(&self, chain: ChainRef) -> Option<String> {
+        self.rpc_urls.get(&chain).cloned()
     }
 }
 
@@ -124,6 +172,7 @@ pub fn parse_rules(raw: Vec<Rule>) -> HashMap<String, RuleEntry> {
             RuleEntry {
                 clauses,
                 abi_item: rule.abi_item,
+                family_abi: None,
                 multicall,
                 invalid_decoder,
             },

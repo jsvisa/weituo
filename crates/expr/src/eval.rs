@@ -295,18 +295,56 @@ impl Evaluator {
             Expr::BinOp { op, lhs, rhs } => {
                 let l = self.eval_inner(lhs, ctx).await?;
                 let r = self.eval_inner(rhs, ctx).await?;
-                eval_binop(op, &l, &r)
+                eval_binop(op, &l, &r, ctx.case_insensitive_str_eq)
             }
 
             Expr::In { val, list, negated } => {
                 let v = self.eval_inner(val, ctx).await?;
                 let mut found = false;
                 for item in list {
-                    if values_eq(&v, &self.eval_inner(item, ctx).await?) {
+                    if values_eq(
+                        &v,
+                        &self.eval_inner(item, ctx).await?,
+                        ctx.case_insensitive_str_eq,
+                    ) {
                         found = true;
                         break;
                     }
                 }
+                Ok(Value::Bool(if *negated { !found } else { found }))
+            }
+
+            Expr::InSource {
+                val,
+                source,
+                negated,
+            } => {
+                let v = self.eval_inner(val, ctx).await?;
+                let src = self.eval_inner(source, ctx).await?;
+                let items = match src {
+                    Value::Json(boxed) => match *boxed {
+                        serde_json::Value::Array(items) => items,
+                        other => {
+                            return Err(anyhow!(
+                                "'in' requires a list on the right-hand side, got JSON {}",
+                                if other.is_object() {
+                                    "object"
+                                } else {
+                                    "scalar"
+                                }
+                            ))
+                        }
+                    },
+                    other => {
+                        return Err(anyhow!(
+                            "'in' requires a list on the right-hand side, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                let found = items.iter().any(|item| {
+                    values_eq(&v, &Value::from(item.clone()), ctx.case_insensitive_str_eq)
+                });
                 Ok(Value::Bool(if *negated { !found } else { found }))
             }
 
@@ -492,7 +530,7 @@ fn render_operand(v: &Value) -> String {
     }
 }
 
-fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> Result<Value> {
+fn eval_binop(op: &BinOp, l: &Value, r: &Value, case_insensitive: bool) -> Result<Value> {
     if op == &BinOp::Regex {
         let s = match l {
             Value::Str(s) => s,
@@ -533,15 +571,24 @@ fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> Result<Value> {
     }
 
     Ok(Value::Bool(match op {
-        BinOp::Eq => values_eq(l, r),
-        BinOp::Ne => !values_eq(l, r),
+        BinOp::Eq => values_eq(l, r, case_insensitive),
+        BinOp::Ne => !values_eq(l, r, case_insensitive),
         _ => return Err(anyhow!("{op:?} not supported for {}", l.type_name())),
     }))
 }
 
-pub fn values_eq(a: &Value, b: &Value) -> bool {
+/// String equality under the context's case sensitivity: EVM/Sui hex
+/// addresses compare case-insensitively; SVM base58 compares verbatim
+/// (case variants are different pubkeys).
+pub fn values_eq(a: &Value, b: &Value, case_insensitive: bool) -> bool {
     match (a, b) {
-        (Value::Str(s1), Value::Str(s2)) => s1.to_lowercase() == s2.to_lowercase(),
+        (Value::Str(s1), Value::Str(s2)) => {
+            if case_insensitive {
+                s1.to_lowercase() == s2.to_lowercase()
+            } else {
+                s1 == s2
+            }
+        }
         (Value::Bool(b1), Value::Bool(b2)) => b1 == b2,
         (Value::Null, Value::Null) => true,
         // Exact integer equality when both can be represented as U256
@@ -706,12 +753,24 @@ pub fn resolve_attribute(parts: &[AttrSegment], ctx: &EvalContext) -> Value {
         return match parts[0].as_field() {
             Some("from_address") => Value::Str(ctx.from_address.clone()),
             Some("to_address") => Value::Str(ctx.to_address.clone()),
-            Some("chainId") => Value::Int(ctx.chain_id as i64),
+            Some("chainId") => chain_id_value(ctx),
+            Some("network") => Value::Str(ctx.network.clone()),
             Some("value") => Value::BigUint(ctx.value),
             Some("gasPrice") => Value::Int(ctx.gas_price as i64),
             Some("gasLimit") => Value::Int(ctx.gas_limit as i64),
-            _ => Value::Null,
+            other => match other.and_then(|name| ctx.chain_fields.get(name)) {
+                Some(v) => Value::from(v.clone()),
+                None => Value::Null,
+            },
         };
+    }
+
+    // Family-specific context data (accounts, type_arguments, …) — full
+    // attribute paths: `accounts[1]`, `accounts.length`, …
+    if let Some(root) = parts[0].as_field() {
+        if let Some(v) = ctx.chain_fields.get(root) {
+            return traverse_json(v.clone(), &parts[1..]);
+        }
     }
 
     // vars.<name>  — scalar lookup only; deeper paths (vars.FOO.bar) → Null
@@ -742,6 +801,19 @@ pub fn resolve_attribute(parts: &[AttrSegment], ctx: &EvalContext) -> Value {
     }
 
     Value::Null
+}
+
+/// `chainId` resolution per family: EVM (numeric or legacy empty network) →
+/// numeric EIP-155 id; `svm:`/`sui:` networks → the network name without the
+/// family prefix (`"svm:mainnet-beta"` → `"mainnet-beta"`).
+fn chain_id_value(ctx: &EvalContext) -> Value {
+    if ctx.network.is_empty() || ctx.network.starts_with("eip155:") {
+        return Value::Int(ctx.chain_id as i64);
+    }
+    match ctx.network.find(':') {
+        Some(idx) => Value::Str(ctx.network[idx + 1..].to_string()),
+        None => Value::Str(ctx.network.clone()),
+    }
 }
 
 /// Traverse a serde_json::Value using remaining AttrSegments.
