@@ -783,7 +783,8 @@ impl Checker {
             return CheckResult::Ok;
         }
 
-        // 3. Rule lookup: "domain.name::primaryType" acts as the selector
+        // 3. Rule lookup: "domain.name::primaryType" acts as the selector, matched
+        //    case-sensitively (the `rule_key` form): EIP-712 hashes both names verbatim
         let domain_name = normalize_domain_name(&req.domain.name);
         let selector = format!("{}::{}", domain_name, req.primary_type);
         let builtins = self.builtins_for(resolver, req.domain.chain_id);
@@ -1190,8 +1191,22 @@ fn extract_inner_targets(
 #[cfg(test)]
 mod tests {
     use super::DenyReason;
-    use crate::types::normalize_domain_name;
+    use crate::types::{normalize_domain_name, rule_key};
     use weituo_expr::Explain;
+
+    #[test]
+    fn rule_key_keeps_eip712_case_and_lowercases_hex() {
+        assert_eq!(rule_key("0xA9059CBB"), "0xa9059cbb");
+        assert_eq!(rule_key("*"), "*");
+        assert_eq!(rule_key("0x"), "0x");
+        assert_eq!(
+            rule_key("1inch Aggregation Router::Order"),
+            "1inch Aggregation Router::Order"
+        );
+        // domain part normalized like check_sign's request side
+        assert_eq!(rule_key(" ' ::ClobAuth"), "::ClobAuth");
+    }
+
     #[test]
     fn normalize_empty_stays_empty() {
         assert_eq!(normalize_domain_name(""), "");
@@ -1430,9 +1445,9 @@ mod stateless_tests {
         }
     }
 
-    /// One exact EIP-712 rule (`order::order` — keys are the lowercased
-    /// `domain::primaryType`, per the static_loader normalization) plus the
-    /// `"*"` wildcard catch-all on the same contract.
+    /// One exact EIP-712 rule (`order::order` — keys are the case-preserving
+    /// `domain::primaryType`, see `rule_key`) plus the `"*"` wildcard catch-all
+    /// on the same contract.
     fn sign_rules() -> HashMap<String, RuleEntry> {
         HashMap::from([
             (
@@ -1457,6 +1472,43 @@ mod stateless_tests {
         );
         let result = checker(Policy::default()).check_sign(&req, &resolver).await;
         assert!(matches!(result, CheckResult::Ok));
+    }
+
+    /// A mixed-case `domain::primaryType` rule fed through `parse_rules` (the
+    /// provider path) matches a request with the same casing, and only that
+    /// casing: EIP-712 type and domain names are case-sensitive.
+    #[tokio::test]
+    async fn check_sign_matches_mixed_case_key_exactly() {
+        let raw: Vec<crate::types::Rule> = serde_json::from_value(serde_json::json!([{
+            "address": EXCHANGE,
+            "func": "1inch Aggregation Router::Order",
+            "selector": "1inch Aggregation Router::Order",
+            "rules": [{ "expr": "args.amount <= 1000" }],
+        }]))
+        .unwrap();
+        let map = crate::provider::parse_rules(raw);
+        let rules = HashMap::from([((1u64, EXCHANGE.to_string()), map)]);
+        let resolver = resolver(rules);
+        let checker = checker(Policy::default());
+
+        let exact = sign_req(
+            "1inch Aggregation Router",
+            "Order",
+            serde_json::json!({"amount": 1}),
+        );
+        let result = checker.check_sign(&exact, &resolver).await;
+        assert!(matches!(result, CheckResult::Ok), "exact casing must match");
+
+        for (domain, primary_type) in [
+            ("1inch Aggregation Router", "order"),
+            ("1inch aggregation router", "Order"),
+        ] {
+            let req = sign_req(domain, primary_type, serde_json::json!({"amount": 1}));
+            match checker.check_sign(&req, &resolver).await {
+                CheckResult::Denied(reason) => assert_eq!(reason.code(), -32601), // NoSignRule
+                CheckResult::Ok => panic!("{domain}::{primary_type} must not match"),
+            }
+        }
     }
 
     #[tokio::test]
