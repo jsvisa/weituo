@@ -14,7 +14,7 @@ categories = ["web-programming", "cryptography::cryptocurrencies"]
 workspace = true
 
 [dependencies]
-weituo-expr      = { path = "../expr", version = "0.2.5" }
+weituo-expr      = { path = "../expr", version = "0.3.0" }
 anyhow           = { workspace = true }
 thiserror        = { workspace = true }
 serde            = { workspace = true }

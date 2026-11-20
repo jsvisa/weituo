@@ -5,7 +5,7 @@ No WAF concepts, no I/O — just expressions over a context.
 
 ```toml
 [dependencies]
-weituo-expr = "0.2"
+weituo-expr = "0.3"
 ```
 
 ## The language
