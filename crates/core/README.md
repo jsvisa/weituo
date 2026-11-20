@@ -7,7 +7,7 @@ stateful belongs to the embedding service.
 
 ```toml
 [dependencies]
-weituo-core = "0.2"
+weituo-core = "0.3"
 reqwest     = "0.12"   # used by Builtins for chain RPC helpers
 tokio       = "1"
 anyhow      = "1"
