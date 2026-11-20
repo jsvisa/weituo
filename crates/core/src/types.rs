@@ -311,6 +311,24 @@ pub fn normalize_domain_name(name: &str) -> String {
     }
 }
 
+/// Rule-map key for a rule selector, shared by every loader and by the
+/// checker's lookups.
+///
+/// EIP-712 keys (`domain.name::primaryType`) keep their case: both names are
+/// hashed verbatim into the domain separator and the typeHash, so `X::Order`
+/// and `X::order` are different typed data. Only the domain part is
+/// normalized, the same way `check_sign` normalizes the request's domain.
+/// Every other key (4-byte hex selector, `"*"`, `"0x"`) is lowercased, since
+/// hex is case-insensitive.
+pub fn rule_key(selector: &str) -> String {
+    match selector.split_once("::") {
+        Some((domain, primary_type)) => {
+            format!("{}::{}", normalize_domain_name(domain), primary_type)
+        }
+        None => selector.to_lowercase(),
+    }
+}
+
 // ── EIP-712 typed-data (waf_checkSign param) ──────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]

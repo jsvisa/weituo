@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use tracing::warn;
 
 use crate::decoder::build_decoder;
-use crate::types::{ExprValue, Rule, RuleClause, RuleEntry};
+use crate::types::{rule_key, ExprValue, Rule, RuleClause, RuleEntry};
 
 #[derive(Debug, Clone)]
 pub struct ChainInfo {
@@ -36,7 +36,8 @@ pub trait RuleProvider: Send + Sync {
 /// every answer as call-scoped data.
 #[async_trait]
 pub trait RuleResolver: Send + Sync {
-    /// Rules for one contract, keyed by lowercase selector (`"*"` wildcard
+    /// Rules for one contract, keyed by [`rule_key`] (lowercase hex
+    /// selector, case-preserving EIP-712 `domain::primaryType`; `"*"` wildcard
     /// supported). `None` = contract unknown to the backend (the checker
     /// reports `NoContract`); an entry missing from the map reports `NoRule`.
     async fn contract_rules(
@@ -120,7 +121,7 @@ pub fn parse_rules(raw: Vec<Rule>) -> HashMap<String, RuleEntry> {
             continue;
         }
         map.insert(
-            rule.selector.to_lowercase(),
+            rule_key(&rule.selector),
             RuleEntry {
                 clauses,
                 abi_item: rule.abi_item,

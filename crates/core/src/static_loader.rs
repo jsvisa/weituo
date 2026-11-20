@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::decoder::build_decoder;
 use crate::provider::ChainInfo;
 use crate::types::{
-    normalize_domain_name, AbiItem, DecoderKind, ExprValue, MulticallDecoder, RuleClause, RuleEntry,
+    rule_key, AbiItem, DecoderKind, ExprValue, MulticallDecoder, RuleClause, RuleEntry,
 };
 
 // ── YAML deserialization types ────────────────────────────────────────────────
@@ -68,7 +68,7 @@ struct YamlRule {
 ///
 /// Returns:
 ///   - `chains`: one `ChainInfo` per chain found in the file (rpc_url = "")
-///   - `contracts`: (chain_id, lowercase_address) → (lowercase_selector → RuleEntry)
+///   - `contracts`: (chain_id, lowercase_address) → (`rule_key(selector)` → RuleEntry)
 #[allow(clippy::type_complexity)]
 pub fn load(
     rules_path: &str,
@@ -103,7 +103,7 @@ pub fn load(
         let mut mc_map: HashMap<String, MulticallDecoder> = HashMap::new();
         for mc in &contract.multicall {
             let sel = if mc.func.contains("::") {
-                mc.func.clone()
+                rule_key(&mc.func)
             } else {
                 selector_for(&mc.func)
             };
@@ -122,15 +122,14 @@ pub fn load(
             // check_sign() looks them up the same way as check() — no ABI decoding needed.
             // "*" / "fallback()"  → wildcard "any non-matching selector" (Solidity fallback semantics)
             // "receive()"         → "0x" sentinel for empty calldata (plain ETH send)
-            // "X::Y"              → EIP-712: lowercased domain.name::primaryType
+            // "X::Y"              → EIP-712: domain.name::primaryType, case kept (rule_key)
             // else                → 4-byte keccak selector
             let selector = if rule.func == "*" || rule.func == "fallback()" {
                 "*".to_string()
             } else if rule.func == "receive()" {
                 "0x".to_string()
             } else if rule.func.contains("::") {
-                let (domain, rest) = rule.func.split_once("::").unwrap();
-                format!("{}::{}", normalize_domain_name(domain), rest).to_lowercase()
+                rule_key(&rule.func)
             } else {
                 selector_for(&rule.func)
             };
